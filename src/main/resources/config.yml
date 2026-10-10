@@ -106,6 +106,8 @@ attacks:
     damage: 4.0
     repeats: 3
     warmup-ticks: 20
+    # The charge direction stops following the player this many ticks before the run starts.
+    aim-lock-ticks: 6
     run-ticks: 18
     recovery-ticks: 10
     stun-ticks: 56

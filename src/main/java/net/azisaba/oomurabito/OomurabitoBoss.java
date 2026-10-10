@@ -1055,19 +1055,33 @@ public final class OomurabitoBoss {
 
         double distance = Math.sqrt(horizontalDistanceSquared(current, targetGround));
         boolean needsPositioning = distance < config.groundAttackMinDistance() || distance > config.groundAttackMaxDistance();
-        Location destination = needsPositioning
-                ? targetGround.clone().add(awayFromTarget.multiply(config.groundAttackPreferredDistance()))
-                : current;
-        destination = groundLocation(destination);
+        Location destination = needsPositioning ? groundAttackDestination(targetGround, awayFromTarget) : current;
+        // Outside the arena the ground can be far below the battlefield, so the boss never lands out there.
+        destination = groundLocation(clampToArena(destination));
         destination.setDirection(targetGround.toVector().subtract(destination.toVector()));
 
         movementStart = boss.getLocation().clone();
         movementEnd = destination;
-        if (needsPositioning || Math.abs(movementStart.getY() - movementEnd.getY()) > 0.2) {
+        if (needsPositioning || movementStart.distanceSquared(movementEnd) > 0.04) {
             positioningTicksRemaining = Math.max(1, config.groundAttackPositionTicks());
         } else {
             teleport(destination);
         }
+    }
+
+    /** A spot at the preferred distance from the target, swung around it until it lands inside the arena. */
+    private Location groundAttackDestination(Location targetGround, Vector awayFromTarget) {
+        double distance = config.groundAttackPreferredDistance();
+        for (int step = 0; step <= 6; step++) {
+            for (int side = -1; side <= 1; side += 2) {
+                Vector direction = rotateY(awayFromTarget, Math.toRadians(30.0 * step * side));
+                Location candidate = targetGround.clone().add(direction.multiply(distance));
+                if (horizontalDistanceSquared(candidate, center) <= config.arenaRadius() * config.arenaRadius()) {
+                    return candidate;
+                }
+            }
+        }
+        return targetGround.clone().add(awayFromTarget.clone().multiply(distance));
     }
 
     private void tickTeleport() {
@@ -1230,7 +1244,10 @@ public final class OomurabitoBoss {
         if (chargePhaseTick <= config.chargeWarmupTicks()) {
             invulnerable = false;
             teleport(groundLocation(boss.getLocation()));
-            updateChargeDirection(players);
+            // The aim locks shortly before the run, so a player who keeps sprinting gets clear of the lane.
+            if (chargePhaseTick == 1 || chargePhaseTick <= config.chargeWarmupTicks() - config.chargeAimLockTicks()) {
+                updateChargeDirection(players);
+            }
             if (chargePhaseTick == 1) {
                 scaleTarget = 0.85;
                 chargeStrip = visuals.add(new Visuals.Strip(boss.getLocation().add(0.0, 0.06, 0.0), Material.RED_STAINED_GLASS,
@@ -1255,7 +1272,9 @@ public final class OomurabitoBoss {
         if (chargePhaseTick <= runEnd) {
             invulnerable = true;
             if (chargePhaseTick == config.chargeWarmupTicks() + 1) {
-                updateChargeDirection(players);
+                if (config.chargeWarmupTicks() <= 0) {
+                    updateChargeDirection(players);
+                }
                 if (chargeStrip != null) {
                     chargeStrip.close();
                     chargeStrip = null;
@@ -1264,10 +1283,6 @@ public final class OomurabitoBoss {
                 scaleTarget = 1.0;
                 punchScale(0.25);
                 fx.sound(boss.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 0.8, 0.6f);
-            }
-            Player target = nearestPlayer(players);
-            if (target != null && isMovingAwayFrom(target, chargeDirection)) {
-                updateChargeDirection(players);
             }
             Location next = moveOnGround(boss.getLocation(), chargeDirection, config.chargeSpeed());
             teleport(next);
@@ -1452,7 +1467,7 @@ public final class OomurabitoBoss {
                 endAttack();
                 return;
             }
-            stompTarget = safeGroundLocation(target.getLocation());
+            stompTarget = safeGroundLocation(clampToArena(target.getLocation()));
             movementStart = boss.getLocation().clone();
             movementEnd = stompTarget.clone().add(0.0, config.stompHeight(), 0.0);
             telegraphCircle(stompTarget.clone().add(0.0, 0.08, 0.0), config.stompShockwaveRadius(), fallEnd);
@@ -1721,17 +1736,17 @@ public final class OomurabitoBoss {
             shockwave.radius = radius;
             drawShockwaveRing(shockwave.center, radius);
 
-            double radiusSquared = radius * radius;
-            double innerRadius = Math.max(0.0, Math.max(previousRadius, radius - config.shockwaveRingThickness()));
-            double innerRadiusSquared = innerRadius * innerRadius;
+            // The first tick is the impact itself, so it also covers everyone standing inside the starting radius.
+            boolean impact = shockwave.age == 1;
             for (Player player : players) {
+                double distance = Math.sqrt(horizontalDistanceSquared(player.getLocation(), shockwave.center));
+                Double lastDistance = shockwave.lastDistances.put(player.getUniqueId(), distance);
                 if (shockwave.hitPlayers.contains(player.getUniqueId())) {
                     continue;
                 }
-                double distanceSquared = horizontalDistanceSquared(player.getLocation(), shockwave.center);
-                if (distanceSquared <= radiusSquared
-                        && distanceSquared >= innerRadiusSquared
-                        && isOnShockwaveHeight(player, shockwave.center)) {
+                // Hit when the front has swept over the player since the last tick, whichever of the two moved.
+                boolean swept = impact || (lastDistance == null ? distance : lastDistance) > previousRadius;
+                if (swept && distance <= radius && isOnShockwaveHeight(player, shockwave.center)) {
                     shockwave.hitPlayers.add(player.getUniqueId());
                     Vector push = player.getLocation().toVector().subtract(shockwave.center.toVector());
                     push.setY(0.0);
@@ -1883,9 +1898,24 @@ public final class OomurabitoBoss {
             horizontal.normalize();
         }
         Location next = from.clone().add(horizontal.multiply(Math.max(0.0, distance)));
-        next = groundLocationAtExactXZ(next);
+        next = groundLocationAtExactXZ(clampToArena(next));
         next.setDirection(horizontal);
         return next;
+    }
+
+    /** Pulls a point back to the arena's edge if it lies beyond it. */
+    private Location clampToArena(Location input) {
+        double dx = input.getX() - center.getX();
+        double dz = input.getZ() - center.getZ();
+        double distance = Math.sqrt(dx * dx + dz * dz);
+        if (distance <= config.arenaRadius()) {
+            return input;
+        }
+        double shrink = config.arenaRadius() / distance;
+        Location clamped = input.clone();
+        clamped.setX(center.getX() + dx * shrink);
+        clamped.setZ(center.getZ() + dz * shrink);
+        return clamped;
     }
 
     private Location groundLocationAtExactXZ(Location input) {
@@ -1958,16 +1988,6 @@ public final class OomurabitoBoss {
     private Vector directionFromYaw(float yaw) {
         double radians = Math.toRadians(yaw);
         return new Vector(-Math.sin(radians), 0.0, Math.cos(radians)).normalize();
-    }
-
-    private boolean isMovingAwayFrom(Player target, Vector direction) {
-        Vector towardTarget = horizontalDirection(boss.getLocation(), target.getLocation());
-        Vector movement = direction.clone();
-        movement.setY(0.0);
-        if (towardTarget.lengthSquared() <= 0.01 || movement.lengthSquared() <= 0.01) {
-            return false;
-        }
-        return movement.normalize().dot(towardTarget) < -0.15;
     }
 
     private Vector nextSpinFallbackDirection(List<Player> players) {
@@ -2214,6 +2234,7 @@ public final class OomurabitoBoss {
         private final double damage;
         private final double pushStrength;
         private final List<UUID> hitPlayers = new ArrayList<>();
+        private final Map<UUID, Double> lastDistances = new HashMap<>();
         private int age;
         private double radius;
 

@@ -15,6 +15,8 @@ public final class BossManager implements Listener {
     private OomurabitoBoss currentBoss;
     private BossIntroCutscene currentIntro;
     private BukkitRunnable pendingIntroTask;
+    // Bosses whose entity is already dead but whose death finale is still playing.
+    private final java.util.List<OomurabitoBoss> finishing = new java.util.ArrayList<>();
 
     BossManager(OomurabitoPlugin plugin) {
         this.plugin = plugin;
@@ -66,9 +68,17 @@ public final class BossManager implements Listener {
         }
     }
 
+    void finished(OomurabitoBoss boss) {
+        finishing.remove(boss);
+    }
+
     void shutdown() {
         cleanupPendingIntro();
         cleanupIntro();
+        for (OomurabitoBoss boss : new java.util.ArrayList<>(finishing)) {
+            boss.remove();
+        }
+        finishing.clear();
         if (currentBoss != null) {
             currentBoss.remove();
             currentBoss = null;
@@ -145,6 +155,9 @@ public final class BossManager implements Listener {
             event.getDrops().clear();
             event.setDroppedExp(0);
             boss.onDeath();
+            if (boss.isFinishing()) {
+                finishing.add(boss);
+            }
             cleanupIntro();
             currentBoss = null;
         }

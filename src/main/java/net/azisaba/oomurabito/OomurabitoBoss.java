@@ -1,23 +1,29 @@
 package net.azisaba.oomurabito;
 
 import dev.twme.textdisplayshape.bukkit.BukkitTriangle;
-import dev.twme.textdisplayshape.shape.Shape;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.DoubleUnaryOperator;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.title.Title;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Color;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Particle;
 import org.bukkit.Registry;
@@ -33,15 +39,33 @@ import org.bukkit.entity.EntityType;
 import org.bukkit.entity.IronGolem;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
+import org.bukkit.entity.Spellcaster;
+import org.bukkit.entity.TextDisplay;
 import org.bukkit.entity.Villager;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.Transformation;
 import org.bukkit.util.Vector;
 import org.joml.Vector3f;
 
 public final class OomurabitoBoss {
     private static final double TWO_PI = Math.PI * 2.0;
     private static final double SVG_RAY_LENGTH = 340.0;
+    private static final Color WHITE = Color.fromRGB(255, 255, 255);
+    private static final Color GOLD = Color.fromRGB(255, 200, 60);
+    private static final Color EMBER = Color.fromRGB(255, 110, 30);
+    private static final Color DANGER = Color.fromRGB(255, 40, 40);
+    private static final Color VOID = Color.fromRGB(130, 50, 210);
+    private static final Color DUSK = Color.fromRGB(40, 10, 70);
+    private static final Color GRASS = Color.fromRGB(110, 220, 90);
+    private static final int TRANSITION_RISE_TICKS = 20;
+    private static final int TRANSITION_SWAP_TICK = 55;
+    private static final int TRANSITION_END_TICK = 85;
+    private static final int AFTERMATH_TICKS = 70;
+    private static final long NIGHT_TIME = 18000L;
     private static final LightRaySpec[] LIGHT_RAYS = {
             new LightRaySpec(0.0, 55.0, 0.13, 255, 255, 230, 22.0, 0.55, 255, 255, 245),
             new LightRaySpec(40.0, 55.0, 0.12, 255, 252, 220, 20.0, 0.48, 255, 255, 240),
@@ -57,12 +81,17 @@ public final class OomurabitoBoss {
     private final OomurabitoPlugin plugin;
     private final BossManager bossManager;
     private final BossConfig config;
+    private final Fx fx;
+    private final Visuals visuals = new Visuals();
     private final Random random = new Random();
     private final Location center;
     private final List<Entity> ownedEntities = new ArrayList<>();
     private final List<VillagerProjectile> projectiles = new ArrayList<>();
     private final List<Shockwave> shockwaves = new ArrayList<>();
-    private final List<Shape> deathLightRayShapes = new ArrayList<>();
+    private final List<BukkitTriangle> deathLightRayShapes = new ArrayList<>();
+    private final List<List<RayPart>> deathRays = new ArrayList<>();
+    private final Map<UUID, Visuals.Beam> beams = new HashMap<>();
+    private final Set<UUID> darkenedPlayers = new HashSet<>();
     private final Map<UUID, Deque<Location>> playerHistory = new HashMap<>();
     private final Map<UUID, Integer> spinHitCooldowns = new HashMap<>();
 
@@ -95,10 +124,30 @@ public final class OomurabitoBoss {
     private Vector spinDirection = new Vector(1.0, 0.0, 0.0);
     private int positioningTicksRemaining;
 
+    private int age;
+    private double scaleMult = 1.0;
+    private double scaleVelocity;
+    private double scaleTarget = 1.0;
+    private double appliedScale = -1.0;
+    private int hitStopTicks;
+    private int guardFeedbackCooldown;
+    private boolean cutscene;
+    private int transitionTick = -1;
+    private Location transitionStart;
+    private Location transitionEnd;
+    private boolean aftermath;
+    private int aftermathTick;
+    private Location aftermathCenter;
+    private UUID lastDamagerId;
+    private float deathRayYaw;
+    private Visuals.Strip chargeStrip;
+    private boolean chargeImpactDone;
+
     OomurabitoBoss(OomurabitoPlugin plugin, BossManager bossManager, Location center) {
         this.plugin = plugin;
         this.bossManager = bossManager;
         this.config = plugin.bossConfig();
+        this.fx = new Fx(config.soundVolume());
         this.center = center.clone();
     }
 
@@ -114,7 +163,7 @@ public final class OomurabitoBoss {
         boss.setHealth(config.maxHealth());
         this.introLockTicks = Math.max(0, introLockTicks);
 
-        bossBar = Bukkit.createBossBar(config.name(), BarColor.YELLOW, BarStyle.SEGMENTED_10);
+        bossBar = Bukkit.createBossBar(bossBarTitle(), BarColor.YELLOW, BarStyle.SEGMENTED_10);
         bossBar.setProgress(1.0);
         idleTicks = config.phaseOneIdleTicks();
 
@@ -140,30 +189,89 @@ public final class OomurabitoBoss {
     }
 
     public void onDamage(EntityDamageEvent event) {
-        if (invulnerable) {
+        recordDamager(event);
+        if (invulnerable || cutscene || transitionTick >= 0) {
             event.setCancelled(true);
-            boss.getWorld().spawnParticle(Particle.END_ROD, boss.getLocation().add(0.0, 1.5, 0.0), 10, 0.7, 0.7, 0.7, 0.02);
+            guardFeedback(true);
             return;
         }
         double guardMult = guardMultiplier();
         if (guardMult <= 0.0) {
             event.setCancelled(true);
-            boss.getWorld().spawnParticle(Particle.END_ROD, boss.getLocation().add(0.0, 1.5, 0.0), 10, 0.7, 0.7, 0.7, 0.02);
+            guardFeedback(true);
             return;
         }
         if (guardMult < 1.0) {
             event.setDamage(event.getDamage() * guardMult);
+            guardFeedback(false);
         }
         if (boss.getHealth() - event.getFinalDamage() <= 0.0) {
             event.setCancelled(true);
             startDeathAnimation();
             return;
         }
+        punchScale(0.05);
         Bukkit.getScheduler().runTask(plugin, (Runnable) this::updateBossBar);
     }
 
     public void onDeath() {
+        if (aftermath) {
+            // The death sequence killed the entity itself and still has its finale to play.
+            return;
+        }
         cleanup(false);
+    }
+
+    boolean isFinishing() {
+        return aftermath;
+    }
+
+    void beginCutscene() {
+        cutscene = true;
+    }
+
+    void endCutscene() {
+        cutscene = false;
+        introLockTicks = 0;
+        scaleTarget = 1.0;
+    }
+
+    void punchScale(double impulse) {
+        scaleVelocity += impulse;
+    }
+
+    void scaleTarget(double target) {
+        scaleTarget = target;
+    }
+
+    /** Sets the size outright; the spring then carries it back to the current target. */
+    void squash(double mult) {
+        scaleMult = mult;
+    }
+
+    void shakeHead() {
+        if (boss instanceof Villager villager) {
+            villager.shakeHead();
+        }
+    }
+
+    Location body() {
+        return boss.getLocation().add(0.0, boss.getHeight() * 0.5, 0.0);
+    }
+
+    /** Ground burst shared by every heavy landing: debris, dust, heaved blocks and a camera kick. */
+    void impactEffect(Location ground, double power) {
+        fx.spawn(Particle.EXPLOSION, ground.clone().add(0.0, 0.3, 0.0), 1, 0.4, 0.1, 0.4, 0.0);
+        fx.debris(ground, (int) (30 * power), 0.8 * power, 0.25);
+        fx.radialBurst(Particle.CLOUD, ground.clone().add(0.0, 0.2, 0.0), (int) (16 * power), 0.3 + 0.1 * power, 0.05);
+        fx.spawn(Particle.CAMPFIRE_COSY_SMOKE, ground.clone().add(0.0, 0.3, 0.0), (int) (6 * power), 0.8 * power, 0.2, 0.8 * power, 0.02);
+        visuals.add(new Visuals.Rubble(ground, 1.6 * power, (int) (6 + 3 * power), 0.8, random));
+        fx.shake(ground.getWorld().getPlayers(), ground, 8.0 * power);
+    }
+
+    /** A harmless ring that sweeps outward along the ground. */
+    void ringEffect(Location ground, double radius, int ticks) {
+        visuals.add(new Visuals.Ring(ground, Material.WHITE_STAINED_GLASS, 0.5, radius, 0.6, 0.35, ticks, 0));
     }
 
     public void remove() {
@@ -185,13 +293,24 @@ public final class OomurabitoBoss {
     }
 
     private void tick() {
+        age++;
+        if (aftermath) {
+            tickAftermath();
+            return;
+        }
         if (!isAlive()) {
             cleanup(false);
             bossManager.clearIfCurrent(this);
             return;
         }
 
+        tickScale();
+        if (guardFeedbackCooldown > 0) {
+            guardFeedbackCooldown--;
+        }
+
         if (dying) {
+            visuals.tick();
             List<Player> players = activePlayers();
             updateDeathBossBar(players);
             tickShockwaves(players);
@@ -199,18 +318,38 @@ public final class OomurabitoBoss {
             return;
         }
 
-        if (phase() == 2 && !phaseTwoTransformed) {
-            transformToEvoker();
-        }
-
         List<Player> players = activePlayers();
         recordPlayerHistory(players);
         updateBossBar(players);
+        syncSky(players);
+        if (cutscene) {
+            visuals.tick();
+            return;
+        }
+        if (hitStopTicks > 0) {
+            // Everything but the scale wobble holds still for a few ticks so heavy hits read as heavy.
+            hitStopTicks--;
+            return;
+        }
+        visuals.tick();
         tickProjectiles(players);
         tickShockwaves(players);
 
+        if (transitionTick >= 0) {
+            tickTransition(players);
+            return;
+        }
+        if (phase() == 2 && !phaseTwoTransformed) {
+            startTransition();
+            return;
+        }
+        if (phaseTwoTransformed && age % 2 == 0) {
+            fx.dustFade(boss.getLocation().add(0.0, 0.3, 0.0), VOID, DUSK, 1.3f, 2, 0.5);
+        }
+
         if (introLockTicks > 0) {
             introLockTicks--;
+            hoverNearCenter();
             faceNearestPlayer(players);
             return;
         }
@@ -243,7 +382,7 @@ public final class OomurabitoBoss {
         if (positioningTicksRemaining > 0) {
             int totalTicks = Math.max(1, config.groundAttackPositionTicks());
             int elapsedTicks = totalTicks - positioningTicksRemaining + 1;
-            moveBossBetween(movementStart, movementEnd, elapsedTicks, totalTicks);
+            moveBossBetween(movementStart, movementEnd, elapsedTicks, totalTicks, Easing::inOut);
             faceNearestPlayer(players);
             positioningTicksRemaining--;
             if (positioningTicksRemaining <= 0 && movementEnd != null) {
@@ -383,7 +522,11 @@ public final class OomurabitoBoss {
                 teleportLimit = min + random.nextInt(max - min + 1);
                 playSound(boss.getLocation(), Sound.ENTITY_ENDERMAN_TELEPORT, 0.7f);
             }
-            case KNOCKBACK, GOLEM -> prepareGroundAttackPosition(players);
+            case KNOCKBACK -> prepareGroundAttackPosition(players);
+            case GOLEM -> {
+                prepareGroundAttackPosition(players);
+                cast(Spellcaster.Spell.SUMMON_VEX);
+            }
             case CHARGE -> {
                 chargeCount = 0;
                 chargePhaseTick = 0;
@@ -398,11 +541,14 @@ public final class OomurabitoBoss {
             case BEAM, VILLAGER_CANNON -> {
                 movementStart = boss.getLocation().clone();
                 movementEnd = skyLocation();
+                punchScale(0.12);
+                fx.sound(boss.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 0.6, 0.7f);
             }
             case FANG -> {
                 prepareGroundAttackPosition(players);
                 fangDirections = List.of();
-                playSound(boss.getLocation(), Sound.ENTITY_EVOKER_CAST_SPELL, 0.8f);
+                cast(Spellcaster.Spell.FANGS);
+                playSound(boss.getLocation(), Sound.ENTITY_EVOKER_PREPARE_ATTACK, 0.8f);
             }
             case SPIN -> {
                 prepareGroundAttackPosition(players);
@@ -423,6 +569,191 @@ public final class OomurabitoBoss {
         currentAttack = Attack.IDLE;
         attackTick = 0;
         idleTicks = phase() >= 2 ? config.phaseTwoIdleTicks() : config.phaseOneIdleTicks();
+        scaleTarget = 1.0;
+        cast(Spellcaster.Spell.NONE);
+        closeAttackVisuals();
+    }
+
+    private void closeAttackVisuals() {
+        if (chargeStrip != null) {
+            chargeStrip.close();
+            chargeStrip = null;
+        }
+        for (Visuals.Beam beam : beams.values()) {
+            beam.close();
+        }
+        beams.clear();
+    }
+
+    private void hitStop(int ticks) {
+        hitStopTicks = Math.max(hitStopTicks, ticks);
+    }
+
+    private void cast(Spellcaster.Spell spell) {
+        if (boss instanceof Spellcaster caster) {
+            caster.setSpell(spell);
+        }
+    }
+
+    private void tickScale() {
+        // A damped spring, so every change of size overshoots a little and settles.
+        scaleVelocity = (scaleVelocity + (scaleTarget - scaleMult) * 0.35) * 0.62;
+        scaleMult = Math.max(0.2, Math.min(2.0, scaleMult + scaleVelocity));
+        double value = config.scale() * scaleMult;
+        if (Math.abs(value - appliedScale) > 0.004) {
+            appliedScale = value;
+            setAttribute(boss, "scale", value);
+        }
+    }
+
+    private void recordDamager(EntityDamageEvent event) {
+        if (!(event instanceof EntityDamageByEntityEvent byEntity)) {
+            return;
+        }
+        Entity damager = byEntity.getDamager();
+        if (damager instanceof Projectile projectile && projectile.getShooter() instanceof Player shooter) {
+            lastDamagerId = shooter.getUniqueId();
+        } else if (damager instanceof Player player) {
+            lastDamagerId = player.getUniqueId();
+        }
+    }
+
+    private void guardFeedback(boolean blocked) {
+        if (guardFeedbackCooldown > 0) {
+            return;
+        }
+        guardFeedbackCooldown = 4;
+        Location body = body();
+        if (blocked) {
+            fx.spawn(Particle.ENCHANTED_HIT, body, 14, 0.7, 0.9, 0.7, 0.3);
+            fx.spawn(Particle.ELECTRIC_SPARK, body, 10, 0.7, 0.9, 0.7, 0.15);
+            fx.sound(body, Sound.ITEM_SHIELD_BLOCK, 0.25, 1.1f);
+            fx.sound(body, Sound.BLOCK_ANVIL_PLACE, 0.15, 1.9f);
+            punchScale(-0.04);
+        } else {
+            fx.spawn(Particle.ENCHANTED_HIT, body, 6, 0.7, 0.9, 0.7, 0.2);
+            fx.sound(body, Sound.BLOCK_ANVIL_PLACE, 0.1, 1.5f);
+        }
+    }
+
+    /** Damage plus the feedback that makes it register: sparks on the victim and a heavy thud only they hear. */
+    private void strike(Player player, double damage, Vector knockback) {
+        boolean fresh = player.getNoDamageTicks() <= player.getMaximumNoDamageTicks() / 2;
+        if (damage > 0.0) {
+            player.damage(damage, boss);
+        }
+        player.setVelocity(knockback);
+        if (damage > 0.0 && fresh) {
+            Location chest = player.getLocation().add(0.0, 1.0, 0.0);
+            fx.spawn(Particle.CRIT, chest, 14, 0.3, 0.4, 0.3, 0.5);
+            fx.dust(chest, EMBER, 1.6f, 6, 0.35);
+            fx.personalSound(player, Sound.ENTITY_ZOMBIE_ATTACK_IRON_DOOR, 0.7f, 0.6f);
+        }
+    }
+
+    /** A fixed outline of the reach plus a fill that meets it on the tick the attack lands. */
+    private void telegraphCircle(Location ground, double radius, int ticks) {
+        visuals.add(new Visuals.Ring(ground, Material.RED_CONCRETE, radius, radius, 0.18, 0.06, 0, ticks));
+        visuals.add(new Visuals.Ring(ground, Material.RED_STAINED_GLASS, 0.4, radius, 0.5, 0.04, Math.max(1, ticks - 2), 0));
+    }
+
+    private void startTransition() {
+        endAttack();
+        visuals.clear();
+        shockwaves.clear();
+        removeProjectiles();
+        transitionTick = 0;
+        transitionStart = boss.getLocation().clone();
+        transitionEnd = safeGroundLocation(center).add(0.0, config.hoverHeight() + 2.5, 0.0);
+        scaleTarget = 0.85;
+        Location body = body();
+        fx.sound(body, Sound.ENTITY_VILLAGER_HURT, 1.0, 0.5f);
+        fx.sound(body, Sound.BLOCK_BEACON_DEACTIVATE, 0.8, 0.6f);
+        fx.spawn(Particle.CRIT, body, 30, 1.0, 1.0, 1.0, 0.4);
+        hitStop(4);
+    }
+
+    private void tickTransition(List<Player> players) {
+        int tick = ++transitionTick;
+        if (tick < TRANSITION_SWAP_TICK) {
+            double gather = tick / (double) TRANSITION_SWAP_TICK;
+            double rise = Easing.inOut(tick / (double) TRANSITION_RISE_TICKS);
+            double tremble = 0.02 + 0.12 * gather;
+            Location pose = transitionStart.clone()
+                    .add(transitionEnd.toVector().subtract(transitionStart.toVector()).multiply(rise))
+                    .add((random.nextDouble() - 0.5) * tremble, (random.nextDouble() - 0.5) * tremble, (random.nextDouble() - 0.5) * tremble);
+            // The spin winds up faster and faster into the swap.
+            pose.setYaw(transitionStart.getYaw() + (float) (900.0 * gather * gather * gather));
+            pose.setPitch(0.0f);
+            teleport(pose);
+            scaleTarget = 0.85 + 0.1 * Math.sin(tick * 0.8) * gather;
+
+            Location body = body();
+            fx.spawn(Particle.ENCHANT, body, 14, 0.3, 0.3, 0.3, 4.0);
+            fx.spawn(Particle.PORTAL, body, 10, 0.3, 0.5, 0.3, 1.5);
+            fx.dustFade(body, GOLD, VOID, 1.6f, 3, 0.9);
+            if (tick % 2 == 0) {
+                fx.dustRing(safeGroundLocation(pose).add(0.0, 0.1, 0.0), 0.5 + 7.0 * (1.0 - gather), VOID, 1.3f);
+            }
+            if (tick % 10 == 1) {
+                fx.sound(body, Sound.ENTITY_WARDEN_HEARTBEAT, 0.9, (float) (0.8 + gather * 0.6));
+            }
+            if (tick == TRANSITION_RISE_TICKS) {
+                fx.sound(body, Sound.ENTITY_EVOKER_PREPARE_WOLOLO, 1.0, 0.7f);
+                shakeHead();
+            }
+            return;
+        }
+
+        if (tick == TRANSITION_SWAP_TICK) {
+            teleport(transitionEnd);
+            transformToEvoker();
+            faceNearestPlayer(players);
+            cast(Spellcaster.Spell.WOLOLO);
+            scaleMult = 1.5;
+            scaleTarget = 1.0;
+
+            Location body = body();
+            Location ground = safeGroundLocation(boss.getLocation()).add(0.0, 0.08, 0.0);
+            boss.getWorld().strikeLightningEffect(ground);
+            fx.flash(body, WHITE);
+            fx.spawn(Particle.EXPLOSION_EMITTER, body, 1, 0.0, 0.0, 0.0, 0.0);
+            fx.sphereBurst(Particle.SOUL_FIRE_FLAME, body, 50, 0.5);
+            fx.sphereBurst(Particle.END_ROD, body, 40, 0.7);
+            impactEffect(ground, 1.6);
+            ringEffect(ground, 12.0, 16);
+            fx.sound(body, Sound.ENTITY_RAVAGER_ROAR, 1.0, 0.6f);
+            fx.sound(body, Sound.ENTITY_WITHER_SPAWN, 0.7, 1.2f);
+
+            Title title = Title.title(
+                    Component.text(config.name(), NamedTextColor.DARK_RED),
+                    Component.text(config.phaseTwoTitle(), NamedTextColor.RED),
+                    Title.Times.times(java.time.Duration.ofMillis(250), java.time.Duration.ofMillis(2000), java.time.Duration.ofMillis(750))
+            );
+            for (Player player : players) {
+                player.showTitle(title);
+                if (horizontalDistanceSquared(player.getLocation(), ground) <= 144.0) {
+                    Vector away = horizontalDirection(ground, player.getLocation());
+                    player.setVelocity(away.multiply(1.2).setY(0.5));
+                }
+            }
+            return;
+        }
+
+        if (tick < TRANSITION_END_TICK) {
+            faceNearestPlayer(players);
+            Location body = body();
+            fx.spawn(Particle.ANGRY_VILLAGER, body, 2, 1.0, 1.0, 1.0, 0.0);
+            if ((tick - TRANSITION_SWAP_TICK) % 8 == 0) {
+                fx.radialBurst(Particle.SOUL_FIRE_FLAME, body, 24, 0.4, 0.0);
+                punchScale(0.12);
+            }
+            return;
+        }
+
+        cast(Spellcaster.Spell.NONE);
+        transitionTick = -1;
+        idleTicks = 20;
     }
 
     private void startDeathAnimation() {
@@ -435,6 +766,11 @@ public final class OomurabitoBoss {
         attackTick = 0;
         positioningTicksRemaining = 0;
         invulnerable = true;
+        hitStopTicks = 0;
+        transitionTick = -1;
+        cast(Spellcaster.Spell.NONE);
+        closeAttackVisuals();
+        visuals.clear();
         removeProjectiles();
         removeOwnedEntities();
         shockwaves.clear();
@@ -447,14 +783,19 @@ public final class OomurabitoBoss {
         boss.setVelocity(new Vector());
 
         deathStart = boss.getLocation().clone();
-        spawnDeathLightRays(safeGroundLocation(deathStart).add(0.0, 0.15, 0.0));
+        spawnDeathLightRays(deathStart.clone().add(0.0, config.deathLightRaysHeight(), 0.0));
         if (bossBar != null) {
             bossBar.setColor(BarColor.RED);
-            bossBar.setTitle(ChatColor.DARK_RED + config.name() + ChatColor.GRAY + "  STOP");
+            bossBar.setTitle(ChatColor.DARK_RED + config.name());
             bossBar.setProgress(0.0);
         }
-        playSound(deathStart, Sound.ENTITY_VILLAGER_HURT, 0.45f);
-        boss.getWorld().spawnParticle(Particle.END_ROD, deathStart.clone().add(0.0, 1.5, 0.0), 35, 1.0, 0.8, 1.0, 0.01);
+        Location body = body();
+        fx.sound(body, Sound.ENTITY_VILLAGER_HURT, 1.0, 0.45f);
+        fx.sound(body, Sound.BLOCK_BELL_RESONATE, 1.0, 0.7f);
+        fx.sound(body, Sound.BLOCK_ANVIL_LAND, 0.5, 0.5f);
+        fx.spawn(Particle.END_ROD, body, 35, 1.0, 0.8, 1.0, 0.01);
+        fx.spawn(Particle.CRIT, body, 40, 1.0, 1.0, 1.0, 0.6);
+        punchScale(-0.2);
     }
 
     private void tickDeathAnimation() {
@@ -467,43 +808,109 @@ public final class OomurabitoBoss {
         }
 
         if (deathTick <= stopTicks) {
-            Location frozen = deathStart.clone();
-            frozen.setPitch(deathStart.getPitch());
+            double progress = deathTick / (double) Math.max(1, stopTicks);
+            double tremble = 0.03 + 0.14 * progress;
+            Location frozen = deathStart.clone().add(
+                    (random.nextDouble() - 0.5) * tremble,
+                    Easing.out(progress) * 1.5 + (random.nextDouble() - 0.5) * tremble,
+                    (random.nextDouble() - 0.5) * tremble
+            );
             teleport(frozen);
             boss.setVelocity(new Vector());
+            // Swelling, with a flicker that gets more violent toward the end.
+            scaleTarget = 1.0 + 0.3 * progress + 0.08 * Math.sin(deathTick * 1.9) * progress;
+
+            Location body = body();
+            fx.directed(Particle.END_ROD, body, Vector.getRandom().subtract(new Vector(0.5, 0.5, 0.5)).normalize(), 0.25 + 0.4 * progress);
+            fx.dustFade(body, WHITE, GOLD, 1.8f, 2 + (int) (6 * progress), 0.9);
             if (deathTick % 4 == 0) {
-                boss.getWorld().spawnParticle(Particle.CRIT, frozen.clone().add(0.0, 1.2, 0.0), 8, 0.9, 0.7, 0.9, 0.0);
+                fx.spawn(Particle.CRIT, body, 8, 0.9, 0.7, 0.9, 0.0);
             }
             if (deathTick % 5 == 1) {
-                float progress = stopTicks <= 0 ? 1.0f : deathTick / (float) stopTicks;
-                playSound(frozen, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, 0.55f + progress * 1.25f);
+                fx.sound(body, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, 0.8, (float) (0.55 + progress * 1.25));
             }
+            tickDeathLightRays(stopTicks);
             return;
         }
 
         if (deathTick == stopTicks + 1) {
-            Location impact = safeGroundLocation(boss.getLocation()).add(0.0, 0.15, 0.0);
-            playSound(impact, Sound.ENTITY_GENERIC_EXPLODE, 0.55f);
-            playSound(impact, Sound.ENTITY_WITHER_DEATH, 0.75f);
-            boss.getWorld().spawnParticle(Particle.EXPLOSION, impact, 5, 1.8, 0.5, 1.8, 0.0);
-            boss.getWorld().spawnParticle(Particle.POOF, impact, Math.max(1, config.deathParticleCount()), 2.2, 1.0, 2.2, 0.12);
-            createShockwave(impact, config.deathShockwaveRadius(), 0.0, config.deathShockwavePush());
-            removeDeathLightRays();
-            boss.setInvulnerable(false);
-            boss.setCollidable(true);
-            boss.setGravity(true);
-            boss.setHealth(0.0);
+            burst();
         }
     }
 
-    private void spawnDeathLightRays(Location impact) {
+    /** The end of the death sequence: the boss dies for real here, hidden behind the flash. */
+    private void burst() {
+        Location body = body();
+        Location ground = safeGroundLocation(boss.getLocation()).add(0.0, 0.15, 0.0);
+        fx.flash(body, WHITE);
+        fx.spawn(Particle.EXPLOSION_EMITTER, body, 1, 0.0, 0.0, 0.0, 0.0);
+        fx.spawn(Particle.EXPLOSION, body, 5, 1.8, 0.5, 1.8, 0.0);
+        fx.spawn(Particle.POOF, body, Math.max(1, config.deathParticleCount()), 2.2, 1.0, 2.2, 0.12);
+        fx.sphereBurst(Particle.END_ROD, body, 80, 0.6);
+        fx.sphereBurst(Particle.FIREWORK, body, 60, 0.4);
+        fx.sound(body, Sound.ENTITY_GENERIC_EXPLODE, 1.0, 0.55f);
+        fx.sound(body, Sound.ENTITY_WITHER_DEATH, 1.0, 0.75f);
+        fx.sound(body, Sound.ITEM_TOTEM_USE, 0.6, 1.2f);
+        impactEffect(ground, 2.0);
+        createShockwave(ground, config.deathShockwaveRadius(), 0.0, config.deathShockwavePush());
+        removeDeathLightRays();
+        restoreSky();
+
+        aftermath = true;
+        aftermathTick = 0;
+        aftermathCenter = body;
+        Player killer = lastDamagerId == null ? null : Bukkit.getPlayer(lastDamagerId);
+        if (killer != null) {
+            boss.setKiller(killer);
+        }
+        // setHealth(0) runs the vanilla death, so EntityDeathEvent fires as usual. The entity is removed right after
+        // so the flash is the last thing seen of it, not the vanilla fall-over.
+        boss.setInvisible(true);
+        boss.setHealth(0.0);
+        boss.remove();
+    }
+
+    private void tickAftermath() {
+        aftermathTick++;
+        List<Player> players = activePlayers();
+        updateDeathBossBar(players);
+        tickShockwaves(players);
+        visuals.tick();
+
+        if (aftermathTick <= AFTERMATH_TICKS - 20) {
+            for (int index = 0; index < 4; index++) {
+                double angle = random.nextDouble() * TWO_PI;
+                double distance = random.nextDouble() * 7.0;
+                Location point = aftermathCenter.clone().add(Math.cos(angle) * distance, random.nextDouble() * 6.0, Math.sin(angle) * distance);
+                fx.directed(Particle.END_ROD, point, new Vector(0.0, -1.0, 0.0), 0.05);
+                fx.spawn(Particle.ITEM, point, 1, 0.0, 0.0, 0.0, 0.05, new ItemStack(Material.EMERALD));
+            }
+        }
+        if (aftermathTick == 25) {
+            Title title = Title.title(
+                    Component.text(config.name(), NamedTextColor.GOLD),
+                    Component.text("討伐完了", NamedTextColor.GRAY),
+                    Title.Times.times(java.time.Duration.ofMillis(500), java.time.Duration.ofMillis(2500), java.time.Duration.ofMillis(1000))
+            );
+            for (Player player : players) {
+                player.showTitle(title);
+                fx.personalSound(player, Sound.UI_TOAST_CHALLENGE_COMPLETE, 1.0f, 1.0f);
+            }
+        }
+        if (aftermathTick >= AFTERMATH_TICKS) {
+            cleanup(false);
+            bossManager.finished(this);
+        }
+    }
+
+    private void spawnDeathLightRays(Location origin) {
         if (!config.deathLightRaysEnabled()) {
             return;
         }
         removeDeathLightRays();
-        Location origin = impact.clone().add(0.0, config.deathLightRaysHeight(), 0.0);
         origin.setYaw(0.0f);
         origin.setPitch(0.0f);
+        deathRayYaw = 0.0f;
 
         Vector forward = deathStart == null ? boss.getLocation().getDirection() : deathStart.getDirection();
         forward.setY(0.0);
@@ -514,31 +921,82 @@ public final class OomurabitoBoss {
         Vector right = new Vector(-forward.getZ(), 0.0, forward.getX()).normalize();
         Vector up = new Vector(0.0, 1.0, 0.0);
 
-        List<Shape> shapes = new ArrayList<>();
         double scale = Math.max(0.001, config.deathLightRaysScale());
         float viewRange = (float) Math.max(1.0, config.deathLightRaysViewRange());
         for (LightRaySpec spec : LIGHT_RAYS) {
-            spawnRayTriangle(shapes, origin, right, up, spec.angleDegrees(), spec.wideHalfWidth(), scale,
+            List<RayPart> parts = new ArrayList<>();
+            spawnRayTriangle(parts, origin, right, up, spec.angleDegrees(), spec.wideHalfWidth(), scale,
                     color(spec.wideAlpha(), spec.wideRed(), spec.wideGreen(), spec.wideBlue()), viewRange);
-            spawnRayTriangle(shapes, origin, right, up, spec.angleDegrees(), spec.narrowHalfWidth(), scale,
+            spawnRayTriangle(parts, origin, right, up, spec.angleDegrees(), spec.narrowHalfWidth(), scale,
                     color(spec.narrowAlpha(), spec.narrowRed(), spec.narrowGreen(), spec.narrowBlue()), viewRange);
+            deathRays.add(parts);
         }
-        deathLightRayShapes.addAll(shapes);
+    }
+
+    /** Rays shoot out one after another, the whole fan turns slowly, and everything flares just before the burst. */
+    private void tickDeathLightRays(int stopTicks) {
+        if (deathRays.isEmpty()) {
+            return;
+        }
+        int gap = Math.max(1, (int) (stopTicks * 0.55) / deathRays.size());
+        int revealTick = deathTick - 3;
+        if (revealTick >= 0 && revealTick % gap == 0 && revealTick / gap < deathRays.size()) {
+            for (RayPart part : deathRays.get(revealTick / gap)) {
+                morphRay(part, 1.0f, 8);
+            }
+            fx.sound(body(), Sound.BLOCK_AMETHYST_BLOCK_CHIME, 0.8, 0.6f + 0.1f * (revealTick / gap));
+        }
+        if (deathTick == stopTicks - 5) {
+            for (List<RayPart> parts : deathRays) {
+                for (RayPart part : parts) {
+                    morphRay(part, 1.4f, 5);
+                }
+            }
+        }
+        if (deathTick % 5 == 0) {
+            deathRayYaw += 10.0f;
+            for (List<RayPart> parts : deathRays) {
+                for (RayPart part : parts) {
+                    if (part.display().isValid()) {
+                        part.display().setRotation(deathRayYaw, 0.0f);
+                    }
+                }
+            }
+        }
+    }
+
+    private void morphRay(RayPart part, float size, int ticks) {
+        if (!part.display().isValid()) {
+            return;
+        }
+        part.display().setInterpolationDelay(0);
+        part.display().setInterpolationDuration(ticks);
+        part.display().setTransformation(scaledFromOrigin(part.full(), size));
+    }
+
+    private Transformation scaledFromOrigin(Transformation full, float size) {
+        return new Transformation(
+                new Vector3f(full.getTranslation()).mul(size),
+                full.getLeftRotation(),
+                new Vector3f(full.getScale()).mul(size),
+                full.getRightRotation()
+        );
     }
 
     private void removeDeathLightRays() {
-        for (Shape shape : deathLightRayShapes) {
+        for (BukkitTriangle shape : deathLightRayShapes) {
             shape.remove();
         }
         deathLightRayShapes.clear();
+        deathRays.clear();
     }
 
-    private void spawnRayTriangle(List<Shape> shapes, Location origin, Vector right, Vector up, double angleDegrees,
+    private void spawnRayTriangle(List<RayPart> parts, Location origin, Vector right, Vector up, double angleDegrees,
                                   double halfWidth, double scale, Color color, float viewRange) {
         Vector3f p1 = toVector3f(origin);
         Vector3f p2 = toVector3f(svgPoint(origin, right, up, -halfWidth, -SVG_RAY_LENGTH, angleDegrees, scale));
         Vector3f p3 = toVector3f(svgPoint(origin, right, up, halfWidth, -SVG_RAY_LENGTH, angleDegrees, scale));
-        Shape shape = new BukkitTriangle.Builder(origin.clone(), p1, p2, p3)
+        BukkitTriangle shape = new BukkitTriangle.Builder(origin.clone(), p1, p2, p3)
                 .color(color)
                 .doubleSided(true)
                 .brightness(15, 15)
@@ -546,7 +1004,15 @@ public final class OomurabitoBoss {
                 .viewRange(viewRange)
                 .build();
         shape.spawn();
-        shapes.add(shape);
+        deathLightRayShapes.add(shape);
+        // Every ray starts collapsed into the origin so it can be shot out later.
+        for (TextDisplay display : shape.getEntities()) {
+            Transformation full = display.getTransformation();
+            display.setPersistent(false);
+            display.setTeleportDuration(5);
+            display.setTransformation(scaledFromOrigin(full, 0.0f));
+            parts.add(new RayPart(display, full));
+        }
     }
 
     private Location svgPoint(Location origin, Vector right, Vector up, double x, double y, double angleDegrees, double scale) {
@@ -606,15 +1072,32 @@ public final class OomurabitoBoss {
 
     private void tickTeleport() {
         int interval = Math.max(1, config.teleportIntervalTicks());
+        if (teleportCount < teleportLimit && (attackTick + 4) % interval == 1) {
+            // Shrinks away just before each blink.
+            scaleTarget = 0.55;
+        }
         if (attackTick % interval == 1 && teleportCount < teleportLimit) {
             teleportCount++;
             Location from = boss.getLocation().clone();
+            Location fromBody = body();
             Location destination = randomArenaLocation(0.0);
-            boss.getWorld().spawnParticle(Particle.PORTAL, from, 45, 1.0, 1.0, 1.0, 0.08);
-            drawLine(from, destination, Particle.PORTAL, Math.max(0.2, config.teleportTrailStep()));
+            fx.spawn(Particle.PORTAL, fromBody, 60, 0.6, 1.0, 0.6, 1.2);
+            fx.spawn(Particle.REVERSE_PORTAL, fromBody, 40, 0.3, 0.8, 0.3, 0.15);
+            fx.dustRing(from.clone().add(0.0, 0.1, 0.0), 1.6, VOID, 1.4f);
             teleport(destination);
-            boss.getWorld().spawnParticle(Particle.PORTAL, destination, 45, 1.0, 1.0, 1.0, 0.08);
-            playSound(destination, Sound.ENTITY_ENDERMAN_TELEPORT, 0.8f);
+            Location destinationBody = body();
+            fx.line(fromBody, destinationBody, Math.max(0.2, config.teleportTrailStep()), point -> {
+                fx.dustFade(point, VOID, DUSK, 1.6f, 1, 0.08);
+                fx.spawn(Particle.PORTAL, point, 2, 0.1, 0.1, 0.1, 0.3);
+            });
+            fx.spawn(Particle.REVERSE_PORTAL, destinationBody, 50, 0.3, 0.8, 0.3, 0.2);
+            fx.radialBurst(Particle.END_ROD, destinationBody, 16, 0.25, 0.0);
+            fx.dustRing(destination.clone().add(0.0, 0.1, 0.0), 2.0, VOID, 1.5f);
+            fx.sound(destination, Sound.ENTITY_ENDERMAN_TELEPORT, 0.8, 0.8f);
+            fx.sound(destination, Sound.ENTITY_ILLUSIONER_MIRROR_MOVE, 0.6, 1.2f);
+            // Pops back to full size on arrival.
+            scaleMult = 0.35;
+            scaleTarget = 1.0;
         }
         if (teleportCount >= teleportLimit && attackTick > teleportLimit * interval + 12) {
             endAttack();
@@ -622,14 +1105,31 @@ public final class OomurabitoBoss {
     }
 
     private void tickKnockback(List<Player> players) {
-        Location source = boss.getLocation().add(0.0, 1.3, 0.0);
+        Location source = body();
+        Location ground = safeGroundLocation(boss.getLocation()).add(0.0, 0.08, 0.0);
+        if (attackTick == 1) {
+            telegraphCircle(ground, config.knockbackShockwaveRadius(), 21);
+            scaleTarget = 0.8;
+            shakeHead();
+            fx.sound(source, Sound.ENTITY_BREEZE_INHALE, 0.8, 0.6f);
+        }
         if (attackTick <= 20) {
-            boss.getWorld().spawnParticle(Particle.CLOUD, source, 8, 1.1, 0.4, 1.1, 0.02);
+            // Air being drawn in toward the boss.
+            for (int index = 0; index < 3; index++) {
+                double angle = attackTick * 0.9 + index * TWO_PI / 3.0;
+                Vector offset = new Vector(Math.cos(angle) * 3.5, 0.0, Math.sin(angle) * 3.5);
+                fx.directed(Particle.CLOUD, source.clone().add(offset), offset.clone().normalize().multiply(-1.0), 0.35);
+            }
         }
         if (attackTick == 22) {
-            playSound(source, Sound.ENTITY_IRON_GOLEM_ATTACK, 0.7f);
-            Location shockwave = safeGroundLocation(boss.getLocation()).add(0.0, 0.08, 0.0);
-            createShockwave(shockwave, 8.0, config.knockbackDamage(), 1.8);
+            scaleTarget = 1.0;
+            punchScale(0.3);
+            fx.sound(source, Sound.ENTITY_IRON_GOLEM_ATTACK, 1.0, 0.7f);
+            fx.sound(source, Sound.ENTITY_BREEZE_WIND_BURST, 0.8, 0.7f);
+            fx.spawn(Particle.GUST_EMITTER_SMALL, source, 1, 0.0, 0.0, 0.0, 0.0);
+            impactEffect(ground, 1.2);
+            hitStop(2);
+            createShockwave(ground, config.knockbackShockwaveRadius(), config.knockbackDamage(), 1.8);
         }
         if (attackTick >= 38) {
             endAttack();
@@ -638,7 +1138,9 @@ public final class OomurabitoBoss {
 
     private void tickGolem() {
         if (attackTick < 24) {
-            boss.getWorld().spawnParticle(Particle.HAPPY_VILLAGER, boss.getLocation().add(0.0, 1.5, 0.0), 5, 1.2, 0.6, 1.2, 0.02);
+            Location body = body();
+            fx.spawn(Particle.HAPPY_VILLAGER, body, 5, 1.2, 0.6, 1.2, 0.02);
+            fx.spawn(Particle.ENCHANT, body, 6, 0.3, 0.3, 0.3, 3.0);
         }
         if (attackTick == 24) {
             int aliveGolems = (int) ownedEntities.stream()
@@ -652,8 +1154,12 @@ public final class OomurabitoBoss {
                 golem.setCustomName(ChatColor.GRAY + "大村人のゴーレム");
                 golem.setCustomNameVisible(true);
                 ownedEntities.add(golem);
-                boss.getWorld().spawnParticle(Particle.POOF, golem.getLocation().add(0.0, 1.0, 0.0), 30, 0.7, 0.7, 0.7, 0.04);
+                Location spot = golem.getLocation();
+                fx.debris(spot, 30, 0.7, 0.2);
+                fx.spawn(Particle.POOF, spot.clone().add(0.0, 1.0, 0.0), 30, 0.7, 0.7, 0.7, 0.04);
+                fx.dustRing(spot.clone().add(0.0, 0.1, 0.0), 1.5, WHITE, 1.3f);
             }
+            punchScale(0.15);
             playSound(boss.getLocation(), Sound.ENTITY_IRON_GOLEM_REPAIR, 0.8f);
         }
         if (attackTick >= 48) {
@@ -664,19 +1170,30 @@ public final class OomurabitoBoss {
     private void tickVillagerCannon(List<Player> players) {
         int skyTicks = Math.max(0, config.skyMoveTicks());
         if (attackTick <= skyTicks) {
-            moveBossBetween(movementStart, movementEnd, attackTick, skyTicks);
+            moveBossBetween(movementStart, movementEnd, attackTick, skyTicks, Easing::inOut);
             faceNearestPlayer(players);
             return;
         }
 
         int actionTick = attackTick - skyTicks;
+        if (actionTick == 1) {
+            cast(Spellcaster.Spell.SUMMON_VEX);
+            scaleTarget = 0.88;
+            shakeHead();
+            fx.sound(boss.getLocation(), Sound.ENTITY_EVOKER_PREPARE_SUMMON, 0.8, 1.1f);
+        }
         if (actionTick <= config.cannonWarmupTicks()) {
-            boss.getWorld().spawnParticle(Particle.ANGRY_VILLAGER, boss.getLocation().add(0.0, 1.3, 0.0), 3, 0.8, 0.5, 0.8, 0.01);
+            Location body = body();
+            fx.spawn(Particle.ENCHANT, body, 10, 0.2, 0.2, 0.2, 3.0);
+            fx.spawn(Particle.ANGRY_VILLAGER, body, 3, 0.8, 0.5, 0.8, 0.01);
             return;
         }
 
         int fireTick = actionTick - config.cannonWarmupTicks() - 1;
         int interval = Math.max(1, config.cannonShotIntervalTicks());
+        if (fireTick == 0) {
+            scaleTarget = 1.0;
+        }
         if (fireTick >= 0 && fireTick % interval == 0) {
             int shotIndex = fireTick / interval;
             if (shotIndex < config.cannonShotCount()) {
@@ -684,6 +1201,8 @@ public final class OomurabitoBoss {
                 for (Player target : players) {
                     fireVillagerProjectile(target);
                 }
+                // Recoil.
+                punchScale(-0.06);
             }
         }
 
@@ -696,7 +1215,12 @@ public final class OomurabitoBoss {
         chargePhaseTick++;
         if (chargeCount >= config.chargeRepeats()) {
             invulnerable = false;
-            boss.getWorld().spawnParticle(Particle.CRIT, boss.getLocation().add(0.0, 1.4, 0.0), 6, 0.8, 0.5, 0.8, 0.02);
+            // Dizzy: stars circling the head.
+            Location head = boss.getLocation().add(0.0, boss.getHeight() + 0.3, 0.0);
+            for (int index = 0; index < 3; index++) {
+                double angle = age * 0.45 + index * TWO_PI / 3.0;
+                fx.dust(head.clone().add(Math.cos(angle) * 0.9, 0.0, Math.sin(angle) * 0.9), GOLD, 1.3f, 1, 0.0);
+            }
             if (chargePhaseTick >= config.chargeStunTicks()) {
                 endAttack();
             }
@@ -707,7 +1231,23 @@ public final class OomurabitoBoss {
             invulnerable = false;
             teleport(groundLocation(boss.getLocation()));
             updateChargeDirection(players);
-            boss.getWorld().spawnParticle(Particle.ANGRY_VILLAGER, boss.getLocation().add(0.0, 1.5, 0.0), 6, 0.8, 0.5, 0.8, 0.01);
+            if (chargePhaseTick == 1) {
+                scaleTarget = 0.85;
+                chargeStrip = visuals.add(new Visuals.Strip(boss.getLocation().add(0.0, 0.06, 0.0), Material.RED_STAINED_GLASS,
+                        config.chargeSpeed() * config.chargeRunTicks(), 0.05));
+                fx.sound(boss.getLocation(), Sound.ENTITY_RAVAGER_ROAR, 0.6, 1.4f);
+            }
+            if (chargeStrip != null) {
+                // The lane widens to the real hit width as the windup completes.
+                double widen = Easing.out(chargePhaseTick / (double) Math.max(1, config.chargeWarmupTicks()));
+                chargeStrip.aim(chargeDirection, 0.3 + 4.7 * widen);
+            }
+            if (chargePhaseTick % 4 == 0) {
+                // Pawing the ground.
+                fx.debris(boss.getLocation(), 8, 0.5, 0.1);
+                fx.sound(boss.getLocation(), Sound.ENTITY_RAVAGER_STEP, 0.3, 0.8f);
+            }
+            fx.spawn(Particle.ANGRY_VILLAGER, boss.getLocation().add(0.0, 1.5, 0.0), 2, 0.8, 0.5, 0.8, 0.01);
             return;
         }
 
@@ -716,6 +1256,14 @@ public final class OomurabitoBoss {
             invulnerable = true;
             if (chargePhaseTick == config.chargeWarmupTicks() + 1) {
                 updateChargeDirection(players);
+                if (chargeStrip != null) {
+                    chargeStrip.close();
+                    chargeStrip = null;
+                }
+                chargeImpactDone = false;
+                scaleTarget = 1.0;
+                punchScale(0.25);
+                fx.sound(boss.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 0.8, 0.6f);
             }
             Player target = nearestPlayer(players);
             if (target != null && isMovingAwayFrom(target, chargeDirection)) {
@@ -723,22 +1271,40 @@ public final class OomurabitoBoss {
             }
             Location next = moveOnGround(boss.getLocation(), chargeDirection, config.chargeSpeed());
             teleport(next);
-            boss.getWorld().spawnParticle(Particle.FLAME, boss.getLocation().add(0.0, 1.0, 0.0), 5, 0.5, 0.3, 0.5, 0.02);
+            fx.debris(next, 6, 0.5, 0.15);
+            fx.directed(Particle.CLOUD, next.clone().add(0.0, 0.3, 0.0), chargeDirection.clone().multiply(-1.0), 0.25);
+            fx.dustFade(body(), EMBER, GOLD, 1.8f, 4, 0.5);
+            fx.spawn(Particle.FLAME, boss.getLocation().add(0.0, 1.0, 0.0), 3, 0.5, 0.3, 0.5, 0.02);
+            if (chargePhaseTick % 3 == 0) {
+                fx.sound(next, Sound.ENTITY_RAVAGER_STEP, 0.5, 0.7f);
+            }
             for (Player player : players) {
                 if (player.getLocation().distanceSquared(boss.getLocation()) <= 6.25) {
-                    player.damage(config.chargeDamage(), boss);
-                    player.setVelocity(chargeDirection.clone().multiply(1.2).setY(0.45));
+                    strike(player, config.chargeDamage(), chargeDirection.clone().multiply(1.2).setY(0.45));
+                    if (!chargeImpactDone) {
+                        chargeImpactDone = true;
+                        fx.sound(next, Sound.ENTITY_IRON_GOLEM_DAMAGE, 0.6, 0.6f);
+                        hitStop(2);
+                    }
                 }
             }
             return;
         }
 
         invulnerable = false;
+        if (chargePhaseTick == runEnd + 1) {
+            // Skidding to a halt.
+            fx.debris(boss.getLocation(), 20, 0.8, 0.2);
+            fx.spawn(Particle.CLOUD, boss.getLocation().add(0.0, 0.3, 0.0), 10, 0.8, 0.1, 0.8, 0.05);
+            punchScale(-0.1);
+        }
         if (chargePhaseTick >= runEnd + config.chargeRecoveryTicks()) {
             chargeCount++;
             chargePhaseTick = 0;
             if (chargeCount >= config.chargeRepeats()) {
+                scaleTarget = 0.9;
                 playSound(boss.getLocation(), Sound.ENTITY_VILLAGER_HURT, 0.6f);
+                fx.sound(boss.getLocation(), Sound.ENTITY_RAVAGER_STUNNED, 0.7, 1.0f);
             }
         }
     }
@@ -764,7 +1330,7 @@ public final class OomurabitoBoss {
     private void tickBeam(List<Player> players) {
         int skyTicks = Math.max(0, config.skyMoveTicks());
         if (attackTick <= skyTicks) {
-            moveBossBetween(movementStart, movementEnd, attackTick, skyTicks);
+            moveBossBetween(movementStart, movementEnd, attackTick, skyTicks, Easing::inOut);
             faceNearestPlayer(players);
             return;
         }
@@ -776,34 +1342,67 @@ public final class OomurabitoBoss {
         }
 
         Location beamStart = boss.getLocation().clone().add(0.0, 1.0, 0.0);
-        if (actionTick <= config.beamWarningTicks()) {
+        int warningTicks = config.beamWarningTicks();
+        pruneBeams(players);
+        if (actionTick == 1) {
+            cast(Spellcaster.Spell.WOLOLO);
+            scaleTarget = 0.9;
+            fx.sound(beamStart, Sound.ENTITY_EVOKER_PREPARE_WOLOLO, 0.8, 0.8f);
+        }
+        if (actionTick == Math.max(1, warningTicks - 34)) {
+            // The warden's charge-up runs about 34 ticks, so it ends as the beam fires.
+            fx.sound(beamStart, Sound.ENTITY_WARDEN_SONIC_CHARGE, 1.0, 1.0f);
+        }
+        if (actionTick <= warningTicks) {
             faceNearestPlayer(players);
+            double charge = actionTick / (double) Math.max(1, warningTicks);
             for (Player player : players) {
                 Location targetLocation = delayedLocation(player, config.beamTargetDelayTicks()).add(0.0, 1.0, 0.0);
-                drawLine(beamStart, targetLocation, Particle.END_ROD, 0.8);
-                boss.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, targetLocation, 8, 0.8, 0.8, 0.8, 0.02);
+                aimBeam(beamFor(player, beamStart, false), beamStart, targetLocation, 0.06 + 0.1 * charge, 0.0);
+                fx.dust(targetLocation, DANGER, 1.2f, 2, 0.25);
+                fx.spawn(Particle.ELECTRIC_SPARK, targetLocation, 3, 0.5, 0.5, 0.5, 0.02);
+            }
+            fx.spawn(Particle.ENCHANT, beamStart, 8, 0.2, 0.2, 0.2, 3.0);
+            if (actionTick % 8 == 1) {
+                fx.sound(beamStart, Sound.BLOCK_RESPAWN_ANCHOR_CHARGE, 0.4, (float) (0.8 + charge));
             }
             return;
         }
 
-        int fireTick = actionTick - config.beamWarningTicks();
+        int fireTick = actionTick - warningTicks;
         if (fireTick <= config.beamDurationTicks()) {
             if (fireTick == 1) {
-                playSound(beamStart, Sound.ENTITY_EVOKER_CAST_SPELL, 0.6f);
+                scaleTarget = 1.0;
+                punchScale(0.2);
+                for (Visuals.Beam beam : beams.values()) {
+                    beam.coreMaterial(Material.WHITE_CONCRETE);
+                }
+                fx.flash(beamStart, GOLD);
+                fx.sound(beamStart, Sound.ENTITY_WARDEN_SONIC_BOOM, 1.0, 0.9f);
+                fx.sound(beamStart, Sound.ENTITY_EVOKER_CAST_SPELL, 1.0, 0.6f);
+                fx.sound(beamStart, Sound.BLOCK_BEACON_ACTIVATE, 0.7, 1.6f);
             }
+            if (fireTick % 12 == 1) {
+                fx.sound(beamStart, Sound.ENTITY_GUARDIAN_ATTACK, 0.6, 0.7f);
+            }
+            double pulse = 1.0 + 0.12 * Math.sin(fireTick * 1.3);
             Player nearest = nearestPlayer(players);
             for (Player beamTarget : players) {
                 Location targetLocation = delayedLocation(beamTarget, config.beamTargetDelayTicks()).add(0.0, 1.0, 0.0);
                 if (beamTarget == nearest) {
                     faceLocation(targetLocation);
                 }
-                drawLine(beamStart, targetLocation, Particle.SONIC_BOOM, 1.4);
+                // The sleeve is as wide as the hit radius, so what you see is what hits.
+                aimBeam(beamFor(beamTarget, beamStart, true), beamStart, targetLocation, 1.1 * pulse, 3.0 * pulse);
+                fx.spawn(Particle.FLAME, targetLocation, 6, 0.4, 0.4, 0.4, 0.08);
+                fx.spawn(Particle.ELECTRIC_SPARK, targetLocation, 6, 0.6, 0.6, 0.6, 0.1);
+                fx.debris(targetLocation.clone().add(0.0, -1.0, 0.0), 5, 0.5, 0.1);
+                fx.line(beamStart, targetLocation, 4.0, point -> fx.spawn(Particle.END_ROD, point, 1, 0.5, 0.5, 0.5, 0.03));
                 if (fireTick % Math.max(1, config.beamDamageIntervalTicks()) == 1) {
                     for (Player player : players) {
                         if (distanceToSegment(player.getLocation().add(0.0, 1.0, 0.0), beamStart, targetLocation) <= 1.6) {
-                            player.damage(config.beamDamage(), boss);
                             Vector push = player.getLocation().toVector().subtract(beamStart.toVector()).normalize().multiply(0.8).setY(0.35);
-                            player.setVelocity(push);
+                            strike(player, config.beamDamage(), push);
                         }
                     }
                 }
@@ -811,14 +1410,42 @@ public final class OomurabitoBoss {
             return;
         }
 
+        if (fireTick == config.beamDurationTicks() + 1) {
+            closeAttackVisuals();
+            cast(Spellcaster.Spell.NONE);
+            fx.sound(beamStart, Sound.BLOCK_BEACON_DEACTIVATE, 0.7, 1.4f);
+        }
         if (fireTick >= config.beamDurationTicks() + config.beamRecoveryTicks()) {
             endAttack();
         }
     }
 
+    private Visuals.Beam beamFor(Player player, Location start, boolean firing) {
+        return beams.computeIfAbsent(player.getUniqueId(), ignored -> visuals.add(new Visuals.Beam(
+                start, firing ? Material.WHITE_CONCRETE : Material.RED_CONCRETE, Material.YELLOW_STAINED_GLASS)));
+    }
+
+    private void aimBeam(Visuals.Beam beam, Location start, Location target, double coreWidth, double glowWidth) {
+        Vector delta = target.toVector().subtract(start.toVector());
+        beam.aim(delta, delta.length(), coreWidth, glowWidth);
+    }
+
+    private void pruneBeams(List<Player> players) {
+        beams.entrySet().removeIf(entry -> {
+            if (players.stream().anyMatch(player -> player.getUniqueId().equals(entry.getKey()))) {
+                return false;
+            }
+            entry.getValue().close();
+            return true;
+        });
+    }
+
     private void tickStomp(List<Player> players) {
         int cycleLength = config.stompAscendTicks() + config.stompWarningTicks() + config.stompFallTicks() + config.stompRecoveryTicks();
         int cycleTick = attackTick - stompCount * cycleLength;
+        int ascendEnd = config.stompAscendTicks();
+        int warningEnd = ascendEnd + config.stompWarningTicks();
+        int fallEnd = warningEnd + config.stompFallTicks();
         if (cycleTick == 1) {
             Player target = randomPlayer(players);
             if (target == null) {
@@ -828,42 +1455,53 @@ public final class OomurabitoBoss {
             stompTarget = safeGroundLocation(target.getLocation());
             movementStart = boss.getLocation().clone();
             movementEnd = stompTarget.clone().add(0.0, config.stompHeight(), 0.0);
+            telegraphCircle(stompTarget.clone().add(0.0, 0.08, 0.0), config.stompShockwaveRadius(), fallEnd);
+            scaleTarget = 1.0;
+            punchScale(0.15);
             playSound(movementEnd, Sound.ENTITY_VILLAGER_CELEBRATE, 0.55f);
+            fx.sound(boss.getLocation(), Sound.ENTITY_ENDER_DRAGON_FLAP, 0.6, 0.9f);
         }
         if (stompTarget == null) {
             endAttack();
             return;
         }
 
-        int ascendEnd = config.stompAscendTicks();
-        int warningEnd = ascendEnd + config.stompWarningTicks();
-        int fallEnd = warningEnd + config.stompFallTicks();
-
         if (cycleTick <= ascendEnd) {
-            moveBossBetween(movementStart, movementEnd, cycleTick, ascendEnd);
+            moveBossBetween(movementStart, movementEnd, cycleTick, ascendEnd, Easing::out);
         } else if (cycleTick <= warningEnd) {
             teleport(movementEnd);
-            boss.getWorld().spawnParticle(Particle.CRIT, stompTarget.clone().add(0.0, 0.15, 0.0), 15, 1.8, 0.05, 1.8, 0.0);
+            // Curls up while it hangs over the target.
+            scaleTarget = 0.82;
+            fx.line(movementEnd, stompTarget, 1.5, point -> fx.dust(point, DANGER, 1.0f, 1, 0.0));
         } else if (cycleTick <= fallEnd) {
-            moveBossBetween(movementEnd, stompTarget, cycleTick - warningEnd, config.stompFallTicks());
-            boss.getWorld().spawnParticle(Particle.CLOUD, boss.getLocation().add(0.0, 0.3, 0.0), 6, 1.2, 0.1, 1.2, 0.02);
+            scaleTarget = 1.15;
+            moveBossBetween(movementEnd, stompTarget, cycleTick - warningEnd, config.stompFallTicks(), Easing::in);
+            fx.dust(boss.getLocation().add(0.0, boss.getHeight(), 0.0), WHITE, 2.0f, 6, 0.6);
         } else if (cycleTick == fallEnd + 1) {
-            playSound(stompTarget, Sound.ENTITY_GENERIC_EXPLODE, 1.1f);
+            // Squashed flat by the landing, then springs back.
+            scaleMult = 0.62;
+            scaleTarget = 1.0;
+            fx.sound(stompTarget, Sound.ENTITY_GENERIC_EXPLODE, 0.8, 1.1f);
+            fx.sound(stompTarget, Sound.ITEM_MACE_SMASH_GROUND_HEAVY, 1.0, 0.8f);
+            fx.sound(stompTarget, Sound.ENTITY_IRON_GOLEM_DAMAGE, 0.6, 0.5f);
             Location shockwave = stompTarget.clone().add(0.0, 0.08, 0.0);
-            createShockwave(shockwave, 4.0, config.stompDamage(), 1.1);
+            impactEffect(shockwave, 1.5);
+            hitStop(3);
+            createShockwave(shockwave, config.stompShockwaveRadius(), config.stompDamage(), 1.1);
         } else if (cycleTick >= cycleLength) {
             stompCount++;
             stompTarget = null;
             if (stompCount >= config.stompCount()) {
                 movementStart = boss.getLocation().clone();
                 movementEnd = randomArenaLocation(config.hoverHeight());
-                moveBossBetween(movementStart, movementEnd, 1, Math.max(1, config.stompAscendTicks()));
+                moveBossBetween(movementStart, movementEnd, 1, Math.max(1, config.stompAscendTicks()), Easing::clamp);
                 endAttack();
             }
         }
     }
 
     private void tickFang(List<Player> players) {
+        Location origin = groundLocation(boss.getLocation());
         if (fangDirections.isEmpty()) {
             Player target = nearestPlayer(players);
             if (target == null) {
@@ -878,19 +1516,30 @@ public final class OomurabitoBoss {
             centerDirection.normalize();
             double angle = Math.toRadians(config.fangSpreadDegrees());
             fangDirections = List.of(rotateY(centerDirection, -angle), centerDirection, rotateY(centerDirection, angle));
+
+            // Warning tiles run out along each line, and each one stays until its fang has bitten.
+            int rowDelay = Math.max(1, config.fangRowDelayTicks());
+            for (Vector direction : fangDirections) {
+                for (int row = 1; row <= config.fangRows(); row++) {
+                    Location tile = safeGroundLocation(origin.clone().add(direction.clone().multiply(config.fangSpacing() * row))).add(0.0, 0.06, 0.0);
+                    visuals.add(new Visuals.Marker(tile, Material.RED_STAINED_GLASS, 1.5, 0.05, row + 1, config.fangWarmupTicks() + row * rowDelay + 4));
+                }
+            }
         }
 
-        Location origin = groundLocation(boss.getLocation());
         if (attackTick <= config.fangWarmupTicks()) {
-            for (Vector direction : fangDirections) {
-                drawGroundWarning(origin, direction, config.fangRows(), config.fangSpacing());
-            }
-            boss.getWorld().spawnParticle(Particle.PORTAL, boss.getLocation().add(0.0, 1.4, 0.0), 8, 0.8, 0.5, 0.8, 0.02);
+            Location body = body();
+            fx.spawn(Particle.WITCH, body, 4, 0.8, 0.8, 0.8, 0.0);
+            fx.spawn(Particle.ENCHANT, body, 6, 0.3, 0.3, 0.3, 3.0);
             return;
         }
 
         int fangTick = attackTick - config.fangWarmupTicks() - 1;
         int delay = Math.max(1, config.fangRowDelayTicks());
+        if (fangTick == 0) {
+            punchScale(0.15);
+            fx.sound(boss.getLocation(), Sound.ENTITY_EVOKER_CAST_SPELL, 0.8, 0.8f);
+        }
         if (fangTick >= 0 && fangTick % delay == 0) {
             int row = fangTick / delay + 1;
             if (row <= config.fangRows()) {
@@ -932,22 +1581,40 @@ public final class OomurabitoBoss {
         next.setYaw(boss.getLocation().getYaw() + 42.0f);
         teleport(next);
 
-        boss.getWorld().spawnParticle(Particle.SWEEP_ATTACK, boss.getLocation().add(0.0, 1.0, 0.0), 3, 1.0, 0.3, 1.0, 0.0);
+        // Two blades sweeping around at exactly the hit radius.
+        Location middle = boss.getLocation().add(0.0, 1.0, 0.0);
+        for (int blade = 0; blade < 2; blade++) {
+            double angle = attackTick * 0.8 + blade * Math.PI;
+            for (double reach = 0.8; reach <= config.spinHitRadius(); reach += 0.5) {
+                fx.dustFade(middle.clone().add(Math.cos(angle) * reach, 0.0, Math.sin(angle) * reach), GOLD, EMBER, 1.5f, 1, 0.0);
+            }
+        }
+        fx.spawn(Particle.SWEEP_ATTACK, middle, 2, 1.0, 0.3, 1.0, 0.0);
+        if (attackTick % 2 == 0) {
+            fx.dustRing(boss.getLocation().add(0.0, 0.1, 0.0), config.spinHitRadius(), EMBER, 1.0f);
+        }
+        if (attackTick % 3 == 0) {
+            fx.debris(boss.getLocation(), 5, 0.8, 0.15);
+        }
+        if (attackTick % 6 == 1) {
+            fx.sound(middle, Sound.ENTITY_PLAYER_ATTACK_SWEEP, 0.6, 0.6f);
+        }
+
         double hitRadiusSquared = config.spinHitRadius() * config.spinHitRadius();
         for (Player player : players) {
             if (player.getLocation().distanceSquared(boss.getLocation()) <= hitRadiusSquared
                     && spinHitCooldowns.getOrDefault(player.getUniqueId(), 0) <= 0) {
-                player.damage(config.spinDamage(), boss);
                 Vector push = player.getLocation().toVector().subtract(boss.getLocation().toVector());
                 if (push.lengthSquared() < 0.01) {
                     push = new Vector(0.0, 0.0, 1.0);
                 }
-                player.setVelocity(push.normalize().multiply(1.0).setY(0.45));
+                strike(player, config.spinDamage(), push.normalize().multiply(1.0).setY(0.45));
                 spinHitCooldowns.put(player.getUniqueId(), Math.max(1, config.spinDamageIntervalTicks()));
             }
         }
 
         if (attackTick >= config.spinDurationTicks()) {
+            punchScale(-0.15);
             endAttack();
         }
     }
@@ -967,7 +1634,10 @@ public final class OomurabitoBoss {
         Vector velocity = delayedTarget.toVector().subtract(origin.toVector()).normalize().multiply(config.cannonProjectileSpeed());
         projectiles.add(new VillagerProjectile(projectile, target.getUniqueId(), velocity));
         ownedEntities.add(projectile);
-        playSound(origin, Sound.ENTITY_VILLAGER_YES, 1.6f);
+        fx.spawn(Particle.FIREWORK, origin, 6, 0.15, 0.15, 0.15, 0.08);
+        fx.directed(Particle.CLOUD, origin, velocity.clone().normalize(), 0.5);
+        fx.sound(origin, Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 0.45, 1.3f);
+        fx.sound(origin, Sound.ENTITY_VILLAGER_YES, 0.35, 1.6f);
     }
 
     private void tickProjectiles(List<Player> players) {
@@ -981,9 +1651,9 @@ public final class OomurabitoBoss {
             }
             if (projectile.lodged) {
                 projectile.lodgedTicks++;
-                projectile.entity.getWorld().spawnParticle(Particle.CLOUD, projectile.entity.getLocation().add(0.0, 0.4, 0.0), 1, 0.1, 0.05, 0.1, 0.0);
+                fx.spawn(Particle.CLOUD, projectile.entity.getLocation().add(0.0, 0.4, 0.0), 1, 0.1, 0.05, 0.1, 0.0);
                 if (projectile.lodgedTicks >= config.cannonProjectileLodgeTicks()) {
-                    projectile.entity.getWorld().spawnParticle(Particle.POOF, projectile.entity.getLocation().add(0.0, 0.5, 0.0), 10, 0.25, 0.25, 0.25, 0.02);
+                    fx.spawn(Particle.POOF, projectile.entity.getLocation().add(0.0, 0.5, 0.0), 10, 0.25, 0.25, 0.25, 0.02);
                     projectile.entity.remove();
                     iterator.remove();
                 }
@@ -1011,13 +1681,15 @@ public final class OomurabitoBoss {
                 lodgeProjectile(projectile, next);
                 continue;
             }
+            // Tumbles through the air.
+            next.setYaw(next.getYaw() + 38.0f);
             teleport(projectile.entity, next);
-            projectile.entity.getWorld().spawnParticle(Particle.HAPPY_VILLAGER, next, 2, 0.2, 0.2, 0.2, 0.0);
+            fx.dustFade(next.clone().add(0.0, 0.4, 0.0), GOLD, GRASS, 1.3f, 2, 0.12);
+            fx.spawn(Particle.HAPPY_VILLAGER, next, 1, 0.2, 0.2, 0.2, 0.0);
 
             for (Player player : players) {
                 if (player.getLocation().distanceSquared(next) <= 2.25) {
-                    player.damage(config.villagerCannonDamage(), boss);
-                    player.setVelocity(projectile.velocity.clone().multiply(1.1).setY(0.45));
+                    strike(player, config.villagerCannonDamage(), projectile.velocity.clone().multiply(1.1).setY(0.45));
                     lodgeProjectile(projectile, player.getLocation());
                     break;
                 }
@@ -1028,10 +1700,15 @@ public final class OomurabitoBoss {
     private void createShockwave(Location center, double maxRadius, double damage, double pushStrength) {
         double startRadius = Math.max(0.0, Math.min(maxRadius, config.shockwaveStartRadius()));
         double speed = Math.max(0.01, config.shockwaveSpeed());
-        int duration = Math.max(1, config.shockwaveTicks());
-        double effectiveMaxRadius = Math.max(maxRadius, startRadius + speed * duration);
-        shockwaves.add(new Shockwave(center.clone(), startRadius, effectiveMaxRadius, speed, duration, damage, pushStrength));
-        center.getWorld().spawnParticle(Particle.EXPLOSION, center.clone().add(0.0, 0.3, 0.0), 1, 0.4, 0.1, 0.4, 0.0);
+        // The wave travels exactly as far as its radius says, which is also what the telegraph draws.
+        int duration = Math.max(1, (int) Math.ceil((maxRadius - startRadius) / speed));
+        shockwaves.add(new Shockwave(center.clone(), startRadius, maxRadius, speed, duration, damage, pushStrength));
+
+        // The display ring takes a couple of ticks to reach clients, so it starts where the wave will be by then.
+        double thickness = config.shockwaveRingThickness();
+        double lead = Math.min(maxRadius, startRadius + speed * 2.0);
+        visuals.add(new Visuals.Ring(center, Material.WHITE_STAINED_GLASS, lead - thickness / 2.0, maxRadius - thickness / 2.0,
+                thickness, 0.35, Math.max(1, duration - 2), 0));
     }
 
     private void tickShockwaves(List<Player> players) {
@@ -1056,15 +1733,12 @@ public final class OomurabitoBoss {
                         && distanceSquared >= innerRadiusSquared
                         && isOnShockwaveHeight(player, shockwave.center)) {
                     shockwave.hitPlayers.add(player.getUniqueId());
-                    if (shockwave.damage > 0.0) {
-                        player.damage(shockwave.damage, boss);
-                    }
                     Vector push = player.getLocation().toVector().subtract(shockwave.center.toVector());
                     push.setY(0.0);
                     if (push.lengthSquared() < 0.01) {
                         push = new Vector(0.0, 0.0, 1.0);
                     }
-                    player.setVelocity(push.normalize().multiply(shockwave.pushStrength).setY(config.shockwaveKnockbackY()));
+                    strike(player, shockwave.damage, push.normalize().multiply(shockwave.pushStrength).setY(config.shockwaveKnockbackY()));
                 }
             }
 
@@ -1075,12 +1749,9 @@ public final class OomurabitoBoss {
     }
 
     private void drawShockwaveRing(Location center, double radius) {
-        int particles = Math.max(8, config.shockwaveRingParticles());
-        for (int index = 0; index < particles; index++) {
-            double angle = TWO_PI * index / particles;
-            Location point = center.clone().add(Math.cos(angle) * radius, 0.0, Math.sin(angle) * radius);
-            center.getWorld().spawnParticle(Particle.CLOUD, point, 1, 0.08, 0.01, 0.08, 0.0);
-        }
+        fx.ring(center, radius, 1.5, config.shockwaveRingParticles(), point -> fx.dust(point, WHITE, 1.3f, 1, 0.05));
+        fx.ring(center, radius, 0.4, 8, point -> fx.spawn(Particle.CLOUD, point, 1, 0.08, 0.01, 0.08, 0.0));
+        fx.ring(center, radius, 0.3, 6, point -> fx.debris(point, 2, 0.2, 0.05));
     }
 
     private void lodgeProjectile(VillagerProjectile projectile, Location impactLocation) {
@@ -1092,8 +1763,11 @@ public final class OomurabitoBoss {
         projectile.lodged = true;
         projectile.lodgedTicks = 0;
         teleport(projectile.entity, lodgedLocation);
-        projectile.entity.getWorld().spawnParticle(Particle.BLOCK, lodgedLocation.clone().add(0.0, 0.6, 0.0), 14, 0.35, 0.15, 0.35, 0.02, lodgedLocation.getBlock().getBlockData());
-        playSound(lodgedLocation, Sound.BLOCK_GRAVEL_HIT, 0.8f);
+        Location surface = lodgedLocation.clone().add(0.0, 0.55, 0.0);
+        fx.debris(surface, 18, 0.35, 0.15);
+        fx.dustRing(surface.clone().add(0.0, 0.1, 0.0), 0.9, GOLD, 1.0f);
+        fx.sound(lodgedLocation, Sound.BLOCK_GRAVEL_HIT, 0.5, 0.8f);
+        fx.sound(lodgedLocation, Sound.ENTITY_VILLAGER_HURT, 0.3, 1.8f);
     }
 
     private void spawnFang(Location location, Vector direction, List<Player> players) {
@@ -1101,19 +1775,12 @@ public final class OomurabitoBoss {
         ground.setDirection(direction);
         Entity fang = boss.getWorld().spawnEntity(ground, EntityType.EVOKER_FANGS);
         ownedEntities.add(fang);
-        playSound(ground, Sound.ENTITY_EVOKER_FANGS_ATTACK, 0.9f);
+        fx.debris(ground, 5, 0.3, 0.1);
+        fx.sound(ground, Sound.ENTITY_EVOKER_FANGS_ATTACK, 0.45, 0.9f);
         for (Player player : players) {
             if (player.getLocation().distanceSquared(ground) <= 2.25) {
-                player.damage(config.fangDamage(), boss);
-                player.setVelocity(direction.clone().multiply(0.35).setY(0.35));
+                strike(player, config.fangDamage(), direction.clone().multiply(0.35).setY(0.35));
             }
-        }
-    }
-
-    private void drawGroundWarning(Location origin, Vector direction, int rows, double spacing) {
-        for (int row = 1; row <= rows; row++) {
-            Location location = origin.clone().add(direction.clone().multiply(spacing * row));
-            boss.getWorld().spawnParticle(Particle.CRIT, safeGroundLocation(location).add(0.0, 0.1, 0.0), 1, 0.2, 0.02, 0.2, 0.0);
         }
     }
 
@@ -1124,9 +1791,14 @@ public final class OomurabitoBoss {
             teleport(randomArenaLocation(config.hoverHeight()));
             return;
         }
-        if (location.getY() < safeGroundLocation(location).getY() + 1.5) {
-            teleport(location.add(0.0, 0.3, 0.0));
+        // A slow bob so the boss never hangs perfectly still.
+        double y = location.getY() + (Math.sin(age * 0.11) - Math.sin((age - 1) * 0.11)) * 0.25;
+        double floor = safeGroundLocation(location).getY() + 1.5;
+        if (y < floor) {
+            y += Math.min(0.3, (floor - y) * 0.35 + 0.02);
         }
+        location.setY(y);
+        teleport(location);
     }
 
     private int phase() {
@@ -1136,16 +1808,13 @@ public final class OomurabitoBoss {
 
     private void transformToEvoker() {
         phaseTwoTransformed = true;
-        Location location = boss.getLocation().clone();
         double health = Math.max(1.0, boss.getHealth());
         Entity oldBoss = boss;
-
-        boss.getWorld().spawnParticle(Particle.POOF, location.add(0.0, 1.0, 0.0), 80, 1.4, 1.0, 1.4, 0.08);
-        playSound(location, Sound.ENTITY_EVOKER_CAST_SPELL, 0.55f);
 
         LivingEntity evoker = (LivingEntity) oldBoss.getWorld().spawnEntity(oldBoss.getLocation(), EntityType.EVOKER);
         oldBoss.remove();
         boss = evoker;
+        appliedScale = -1.0;
         configureBossEntity(boss);
         boss.setHealth(Math.min(health, config.maxHealth()));
         bossBar.setColor(BarColor.RED);
@@ -1190,7 +1859,7 @@ public final class OomurabitoBoss {
                 .add(0.0, config.skyHeight(), 0.0);
     }
 
-    private Location safeGroundLocation(Location input) {
+    Location safeGroundLocation(Location input) {
         World world = input.getWorld();
         int x = input.getBlockX();
         int z = input.getBlockZ();
@@ -1233,7 +1902,7 @@ public final class OomurabitoBoss {
         entity.teleport(location);
     }
 
-    private void moveBossBetween(Location from, Location to, int elapsedTicks, int durationTicks) {
+    private void moveBossBetween(Location from, Location to, int elapsedTicks, int durationTicks, DoubleUnaryOperator easing) {
         if (from == null || to == null) {
             return;
         }
@@ -1241,12 +1910,12 @@ public final class OomurabitoBoss {
             teleport(to);
             return;
         }
-        double progress = Math.max(0.0, Math.min(1.0, elapsedTicks / (double) durationTicks));
+        double progress = easing.applyAsDouble(Easing.clamp(elapsedTicks / (double) durationTicks));
         Location next = from.clone().add(to.toVector().subtract(from.toVector()).multiply(progress));
         next.setYaw(to.getYaw());
         next.setPitch(to.getPitch());
         teleport(next);
-        boss.getWorld().spawnParticle(Particle.CLOUD, next, 2, 0.2, 0.2, 0.2, 0.0);
+        fx.spawn(Particle.CLOUD, next, 2, 0.2, 0.2, 0.2, 0.0);
     }
 
     private void face(Vector direction) {
@@ -1265,8 +1934,19 @@ public final class OomurabitoBoss {
     private void faceLocation(Location target) {
         Vector direction = horizontalDirection(boss.getLocation(), target);
         if (direction.lengthSquared() > 0.01) {
-            face(direction);
+            turnToward(direction, 20.0f);
         }
+    }
+
+    /** Turns at a limited rate, so the boss tracks its target instead of snapping to it. */
+    private void turnToward(Vector direction, float maxDegrees) {
+        Location location = boss.getLocation();
+        Location facing = location.clone();
+        facing.setDirection(direction);
+        float delta = ((facing.getYaw() - location.getYaw()) % 360.0f + 540.0f) % 360.0f - 180.0f;
+        location.setYaw(location.getYaw() + Math.max(-maxDegrees, Math.min(maxDegrees, delta)));
+        location.setPitch(0.0f);
+        teleport(location);
     }
 
     private Vector horizontalDirection(Location from, Location to) {
@@ -1308,20 +1988,6 @@ public final class OomurabitoBoss {
         return new Vector(vector.getX() * cos - vector.getZ() * sin, 0.0, vector.getX() * sin + vector.getZ() * cos).normalize();
     }
 
-    private void drawLine(Location start, Location end, Particle particle, double step) {
-        Vector delta = end.toVector().subtract(start.toVector());
-        double length = delta.length();
-        if (length <= 0.01) {
-            return;
-        }
-        Vector unit = delta.normalize().multiply(step);
-        Location cursor = start.clone();
-        for (double traveled = 0.0; traveled < length; traveled += step) {
-            start.getWorld().spawnParticle(particle, cursor, 1, 0.0, 0.0, 0.0, 0.0);
-            cursor.add(unit);
-        }
-    }
-
     private double horizontalDistanceSquared(Location a, Location b) {
         double dx = a.getX() - b.getX();
         double dz = a.getZ() - b.getZ();
@@ -1346,7 +2012,7 @@ public final class OomurabitoBoss {
     }
 
     private void playSound(Location location, Sound sound, float pitch) {
-        location.getWorld().playSound(location, sound, Math.max(0.1f, config.soundVolume()), pitch);
+        fx.sound(location, sound, 1.0, pitch);
     }
 
     private double guardMultiplier() {
@@ -1370,8 +2036,30 @@ public final class OomurabitoBoss {
     }
 
     private void updateBossBar(List<Player> players) {
-        bossBar.setTitle(ChatColor.GOLD + config.name() + ChatColor.YELLOW + "  Phase " + phase());
+        bossBar.setTitle(bossBarTitle());
         bossBar.setProgress(Math.max(0.0, Math.min(1.0, boss.getHealth() / config.maxHealth())));
+        syncBossBarPlayers(players);
+    }
+
+    private String bossBarTitle() {
+        String phaseTitle = phaseTwoTransformed
+                ? ChatColor.RED + config.phaseTwoTitle()
+                : ChatColor.YELLOW + config.phaseOneTitle();
+        return ChatColor.GOLD + config.name() + ChatColor.DARK_GRAY + " ― " + phaseTitle;
+    }
+
+    private void updateDeathBossBar(List<Player> players) {
+        if (bossBar == null) {
+            return;
+        }
+        bossBar.setTitle(aftermath
+                ? ChatColor.DARK_RED + config.name() + ChatColor.DARK_GRAY + " ― " + ChatColor.GRAY + "討伐"
+                : ChatColor.DARK_RED + config.name());
+        bossBar.setProgress(0.0);
+        syncBossBarPlayers(players);
+    }
+
+    private void syncBossBarPlayers(List<Player> players) {
         for (Player existing : new ArrayList<>(bossBar.getPlayers())) {
             if (!players.contains(existing)) {
                 bossBar.removePlayer(existing);
@@ -1382,20 +2070,36 @@ public final class OomurabitoBoss {
         }
     }
 
-    private void updateDeathBossBar(List<Player> players) {
-        if (bossBar == null) {
-            return;
-        }
-        bossBar.setTitle(ChatColor.DARK_RED + config.name() + ChatColor.GRAY + "  DEFEATED");
-        bossBar.setProgress(0.0);
-        for (Player existing : new ArrayList<>(bossBar.getPlayers())) {
-            if (!players.contains(existing)) {
-                bossBar.removePlayer(existing);
+    /** Phase two is fought under a night sky. Only the players in the fight see it. */
+    private void syncSky(List<Player> players) {
+        boolean dark = phaseTwoTransformed && config.phaseTwoDarkenSky();
+        darkenedPlayers.removeIf(uuid -> {
+            if (dark && players.stream().anyMatch(player -> player.getUniqueId().equals(uuid))) {
+                return false;
+            }
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null) {
+                player.resetPlayerTime();
+            }
+            return true;
+        });
+        if (dark) {
+            for (Player player : players) {
+                if (darkenedPlayers.add(player.getUniqueId())) {
+                    player.setPlayerTime(NIGHT_TIME, false);
+                }
             }
         }
-        for (Player player : players) {
-            bossBar.addPlayer(player);
+    }
+
+    private void restoreSky() {
+        for (UUID uuid : darkenedPlayers) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null) {
+                player.resetPlayerTime();
+            }
         }
+        darkenedPlayers.clear();
     }
 
     private void setAttribute(LivingEntity entity, String key, double value) {
@@ -1427,6 +2131,10 @@ public final class OomurabitoBoss {
         removeProjectiles();
         shockwaves.clear();
         removeOwnedEntities();
+        visuals.clear();
+        beams.clear();
+        chargeStrip = null;
+        restoreSky();
         if (removeBoss && boss != null && boss.isValid()) {
             boss.remove();
         }
@@ -1462,6 +2170,9 @@ public final class OomurabitoBoss {
     }
 
     private record WeightedAttack(Attack attack, double weight) {
+    }
+
+    private record RayPart(TextDisplay display, Transformation full) {
     }
 
     private record LightRaySpec(

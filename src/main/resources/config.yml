@@ -1,5 +1,10 @@
 boss:
   name: "大村人"
+  # Shown next to the name on the boss bar and in the intro / phase change titles.
+  phase-one-title: "村の長"
+  phase-two-title: "邪悪なる本性"
+  # Phase two shows a night sky to players in the arena. Per-player only; world time is untouched.
+  phase-two-darken-sky: true
   max-health: 500.0
   scale: 2.0
   arena-radius: 32.0
@@ -14,9 +19,9 @@ boss:
 combat:
   # Shockwaves only hit players whose feet are within this height from the ground.
   shockwave-height: 0.5
-  shockwave-ticks: 14
   shockwave-start-radius: 0.5
   shockwave-speed: 0.6
+  # Minimum particles per ring; larger rings add more so the edge never breaks up.
   shockwave-ring-particles: 32
   shockwave-ring-thickness: 0.6
   shockwave-knockback-y: 0.75
@@ -33,22 +38,23 @@ movement:
 intro:
   enabled: true
   start-delay-ticks: 20
-  duration-ticks: 90
+  # Shot 1 runs until roar-tick, shot 2 until slam-tick, shot 3 until duration-ticks.
+  duration-ticks: 130
   camera-distance: 11.0
   camera-height: 4.0
   camera-shake-ticks: 15
   title-height: 4.2
   title-scale: 3.0
-  title-appear-tick: 70
+  title-appear-tick: 92
   title-pop-ticks: 8
   camera-orbit-degrees: 35.0
   camera-end-distance: 8.0
-  roar-tick: 40
-  slam-tick: 70
+  roar-tick: 50
+  slam-tick: 85
 
 death:
-  # Fatal damage is cancelled once, then this short freeze makes the boss stop feel delayed.
-  stop-ticks: 34
+  # Fatal damage is cancelled once, then the boss charges up for this long before it bursts.
+  stop-ticks: 70
   shockwave-radius: 16.0
   shockwave-push: 2.2
   particle-count: 140
@@ -74,6 +80,8 @@ attacks:
       phase1: 1.0
       phase2: 1.0
     damage: 7.0
+    # The warning ring on the ground shows exactly this reach.
+    shockwave-radius: 9.0
   golem:
     guard-mult: 1.0
     phase-weights:
@@ -123,6 +131,7 @@ attacks:
       phase1: 1.0
       phase2: 1.0
     damage: 11.0
+    shockwave-radius: 9.0
     count: 3
     approach-ticks: 10
     warning-ticks: 12

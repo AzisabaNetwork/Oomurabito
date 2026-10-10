@@ -47,6 +47,8 @@ intro:
   title-scale: 3.0
   title-appear-tick: 92
   title-pop-ticks: 8
+  # How long the name stays at full size. The cutscene is extended past duration-ticks if needed.
+  title-hold-ticks: 30
   camera-orbit-degrees: 35.0
   camera-end-distance: 8.0
   roar-tick: 50

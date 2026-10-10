@@ -32,6 +32,7 @@ public final class BossIntroCutscene {
     private static final int GROUND_HOLD_TICKS = 12;
     /** Display entities need a moment on the client before a transformation change can be interpolated. */
     private static final int SETTLE_TICKS = 2;
+    private static final int TITLE_SETTLE_TICKS = 4;
 
     private final OomurabitoPlugin plugin;
     private final BossConfig config;
@@ -59,10 +60,13 @@ public final class BossIntroCutscene {
         this.ground = boss.safeGroundLocation(center);
         this.ground.setYaw(0.0f);
         this.ground.setPitch(0.0f);
-        this.durationTicks = Math.max(40, config.introDurationTicks());
-        this.slamTick = clamp(config.introSlamTick(), DIVE_TICKS + 12, durationTicks - 8);
+        int baseDuration = Math.max(40, config.introDurationTicks());
+        this.slamTick = clamp(config.introSlamTick(), DIVE_TICKS + 12, baseDuration - 8);
         this.roarTick = clamp(config.introRoarTick(), 2, slamTick - DIVE_TICKS - 2);
-        this.titleTick = clamp(config.introTitleAppearTick(), slamTick, durationTicks - 1);
+        this.titleTick = clamp(config.introTitleAppearTick(), slamTick, baseDuration - 1);
+        // The cutscene never ends before the title has stood at full size for its hold time.
+        int titleSettled = titleTick + SETTLE_TICKS + Math.max(1, config.introTitlePopTicks()) + TITLE_SETTLE_TICKS;
+        this.durationTicks = Math.max(baseDuration, titleSettled + Math.max(0, config.introTitleHoldTicks()));
 
         for (Player player : players) {
             viewers.add(new CutsceneViewer(player));
@@ -258,7 +262,7 @@ public final class BossIntroCutscene {
             morph(titleDisplay, text(scale * 1.25f, 0.0f), popTicks);
         }
         if (titleAge == SETTLE_TICKS + popTicks) {
-            morph(titleDisplay, text(scale, 0.0f), 4);
+            morph(titleDisplay, text(scale, 0.0f), TITLE_SETTLE_TICKS);
         }
         if (titleAge == SETTLE_TICKS + popTicks + 2) {
             morph(subtitleDisplay, text(subtitleScale, -(0.25f * subtitleScale + 0.1f)), 5);

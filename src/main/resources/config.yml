@@ -1,13 +1,8 @@
 boss:
   name: "大村人"
-  # Shown next to the name on the boss bar and in the intro / phase change titles.
-  phase-one-title: "村の長"
-  phase-two-title: "邪悪なる本性"
-  # Phase two shows a night sky to players in the arena. Per-player only; world time is untouched.
-  phase-two-darken-sky: true
-  max-health: 500.0
+  max-health: 300.0
   scale: 2.0
-  arena-radius: 32.0
+  arena-radius: 16.0
   despawn-seconds-without-players: 60
   phase-two-health-ratio: 0.5
   phase-one-idle-ticks: 55
@@ -19,16 +14,16 @@ boss:
 combat:
   # Shockwaves only hit players whose feet are within this height from the ground.
   shockwave-height: 0.5
+  shockwave-ticks: 60
   shockwave-start-radius: 0.5
-  shockwave-speed: 0.6
-  # Minimum particles per ring; larger rings add more so the edge never breaks up.
-  shockwave-ring-particles: 32
-  shockwave-ring-thickness: 0.6
+  shockwave-speed: 1.0
+  shockwave-ring-particles: 24
+  shockwave-ring-thickness: 0.3
   shockwave-knockback-y: 0.75
-  ground-attack-min-distance: 5.0
+  ground-attack-min-distance: 10.0
   ground-attack-max-distance: 18.0
-  ground-attack-preferred-distance: 10.0
-  ground-attack-position-ticks: 12
+  ground-attack-preferred-distance: 16.0
+  ground-attack-position-ticks: 22
 
 movement:
   hover-height: 4.0
@@ -81,7 +76,7 @@ attacks:
     phase-weights:
       phase1: 1.0
       phase2: 1.0
-    damage: 7.0
+    damage: 6.0
     # The warning ring on the ground shows exactly this reach.
     shockwave-radius: 9.0
   golem:
@@ -92,23 +87,23 @@ attacks:
   villager-cannon:
     guard-mult: 1.0
     phase-weights:
-      phase1: 0.0
-      phase2: 1.0
-    damage: 8.0
+      phase1: 4.0
+      phase2: 4.0
+    damage: 4.0
     warmup-ticks: 20
     shot-count: 20
     shot-interval-ticks: 3
     projectile-speed: 2.35
     projectile-life-ticks: 100
     projectile-lodge-ticks: 35
-    homing-delay-ticks: 12
+    homing-delay-ticks: 8
     homing-strength: 0.12
   charge:
     guard-mult: 0.5
     phase-weights:
       phase1: 0.0
       phase2: 1.0
-    damage: 10.0
+    damage: 4.0
     repeats: 3
     warmup-ticks: 20
     run-ticks: 18
@@ -120,7 +115,7 @@ attacks:
     phase-weights:
       phase1: 0.0
       phase2: 1.0
-    damage: 12.0
+    damage: 4.0
     warning-ticks: 42
     duration-ticks: 50
     recovery-ticks: 20
@@ -132,7 +127,7 @@ attacks:
     phase-weights:
       phase1: 1.0
       phase2: 1.0
-    damage: 11.0
+    damage: 6.0
     shockwave-radius: 9.0
     count: 3
     approach-ticks: 10
@@ -154,14 +149,13 @@ attacks:
   spin:
     guard-mult: 0.0
     phase-weights:
-      phase1: 0.0
+      phase1: 1.0
       phase2: 1.0
-    damage: 9.0
-    duration-ticks: 90
-    speed: 0.55
-    hit-radius: 2.4
-    damage-interval-ticks: 12
-    target-delay-ticks: 8
+    damage: 3.0
+    duration-ticks: 180
+    speed: 0.25
+    hit-radius: 1.2
+    damage-interval-ticks: 24
 
 sound:
   # Minecraft sound range is roughly 16 blocks * volume.

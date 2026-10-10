@@ -1,0 +1,15 @@
+name: Oomurabito
+version: '1.0.0'
+main: net.azisaba.oomurabito.OomurabitoPlugin
+api-version: '1.21'
+authors: [Codex]
+description: Giant flying villager boss for Paper.
+commands:
+  oomurabito:
+    description: Manage the Oomurabito boss.
+    usage: /oomurabito <spawn [world x y z]|kill|status|reload>
+    permission: oomurabito.admin
+permissions:
+  oomurabito.admin:
+    description: Allows managing the Oomurabito boss.
+    default: op

@@ -1,0 +1,157 @@
+boss:
+  name: "大村人"
+  max-health: 500.0
+  scale: 2.0
+  arena-radius: 32.0
+  despawn-seconds-without-players: 60
+  phase-two-health-ratio: 0.5
+  phase-one-idle-ticks: 55
+  phase-two-idle-ticks: 38
+  idle-guard-mult: 1.0
+  max-golems: 3
+  golems-per-cast: 2
+
+combat:
+  # Shockwaves only hit players whose feet are within this height from the ground.
+  shockwave-height: 0.5
+  shockwave-ticks: 14
+  shockwave-start-radius: 0.5
+  shockwave-speed: 0.6
+  shockwave-ring-particles: 32
+  shockwave-ring-thickness: 0.6
+  shockwave-knockback-y: 0.75
+  ground-attack-min-distance: 5.0
+  ground-attack-max-distance: 18.0
+  ground-attack-preferred-distance: 10.0
+  ground-attack-position-ticks: 12
+
+movement:
+  hover-height: 4.0
+  sky-height: 16.0
+  sky-move-ticks: 24
+
+intro:
+  enabled: true
+  start-delay-ticks: 20
+  duration-ticks: 90
+  camera-distance: 11.0
+  camera-height: 4.0
+  camera-shake-ticks: 15
+  title-height: 4.2
+  title-scale: 3.0
+  title-appear-tick: 70
+  title-pop-ticks: 8
+  camera-orbit-degrees: 35.0
+  camera-end-distance: 8.0
+  roar-tick: 40
+  slam-tick: 70
+
+death:
+  # Fatal damage is cancelled once, then this short freeze makes the boss stop feel delayed.
+  stop-ticks: 34
+  shockwave-radius: 16.0
+  shockwave-push: 2.2
+  particle-count: 140
+  light-rays:
+    enabled: true
+    scale: 0.026
+    height: 2.6
+    view-range: 96.0
+
+attacks:
+  teleport:
+    guard-mult: 1.0
+    phase-weights:
+      phase1: 1.0
+      phase2: 1.0
+    min-count: 3
+    max-count: 5
+    interval-ticks: 22
+    trail-step: 0.8
+  knockback:
+    guard-mult: 0.5
+    phase-weights:
+      phase1: 1.0
+      phase2: 1.0
+    damage: 7.0
+  golem:
+    guard-mult: 1.0
+    phase-weights:
+      phase1: 0.0
+      phase2: 0.0
+  villager-cannon:
+    guard-mult: 1.0
+    phase-weights:
+      phase1: 0.0
+      phase2: 1.0
+    damage: 8.0
+    warmup-ticks: 20
+    shot-count: 20
+    shot-interval-ticks: 3
+    projectile-speed: 2.35
+    projectile-life-ticks: 100
+    projectile-lodge-ticks: 35
+    homing-delay-ticks: 12
+    homing-strength: 0.12
+  charge:
+    guard-mult: 0.5
+    phase-weights:
+      phase1: 0.0
+      phase2: 1.0
+    damage: 10.0
+    repeats: 3
+    warmup-ticks: 20
+    run-ticks: 18
+    recovery-ticks: 10
+    stun-ticks: 56
+    speed: 1.55
+  beam:
+    guard-mult: 1.0
+    phase-weights:
+      phase1: 0.0
+      phase2: 1.0
+    damage: 12.0
+    warning-ticks: 42
+    duration-ticks: 50
+    recovery-ticks: 20
+    retarget-interval-ticks: 10
+    target-delay-ticks: 12
+    damage-interval-ticks: 10
+  stomp:
+    guard-mult: 0.5
+    phase-weights:
+      phase1: 1.0
+      phase2: 1.0
+    damage: 11.0
+    count: 3
+    approach-ticks: 10
+    warning-ticks: 12
+    impact-ticks: 12
+    recovery-ticks: 10
+    height: 13.0
+  fang:
+    guard-mult: 0.5
+    phase-weights:
+      phase1: 1.0
+      phase2: 1.0
+    damage: 7.0
+    warmup-ticks: 20
+    rows: 10
+    row-delay-ticks: 2
+    spacing: 1.8
+    spread-degrees: 28.0
+  spin:
+    guard-mult: 0.0
+    phase-weights:
+      phase1: 0.0
+      phase2: 1.0
+    damage: 9.0
+    duration-ticks: 90
+    speed: 0.55
+    hit-radius: 2.4
+    damage-interval-ticks: 12
+    target-delay-ticks: 8
+
+sound:
+  # Minecraft sound range is roughly 16 blocks * volume.
+  volume: 5.0

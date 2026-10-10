@@ -1,0 +1,6 @@
+This plugin includes selected source files from TextDisplayShapes.
+
+Project: TextDisplayShapes
+Repository: https://github.com/TWME-TW/TextDisplayShapes
+License: Apache License 2.0
+Copyright 2026 TWME-TW
